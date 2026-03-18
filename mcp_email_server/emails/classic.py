@@ -433,7 +433,7 @@ class EmailClient:
             await imap.wait_hello_from_server()
 
             # Login and select inbox
-            await imap.login(self.email_server.user_name, self.email_server.password)
+            await imap.login(self.email_server.user_name, self.email_server.password.get_secret_value())
             await _send_imap_id(imap)
             await imap.select(_quote_mailbox(mailbox))
             search_criteria = self._build_search_criteria(
@@ -479,7 +479,7 @@ class EmailClient:
             await imap.wait_hello_from_server()
 
             # Login and select mailbox
-            await imap.login(self.email_server.user_name, self.email_server.password)
+            await imap.login(self.email_server.user_name, self.email_server.password.get_secret_value())
             await _send_imap_id(imap)
             await imap.select(_quote_mailbox(mailbox))
 
@@ -593,7 +593,7 @@ class EmailClient:
             await imap.wait_hello_from_server()
 
             # Login and select inbox
-            await imap.login(self.email_server.user_name, self.email_server.password)
+            await imap.login(self.email_server.user_name, self.email_server.password.get_secret_value())
             await _send_imap_id(imap)
             await imap.select(_quote_mailbox(mailbox))
 
@@ -646,7 +646,7 @@ class EmailClient:
             await imap._client_task
             await imap.wait_hello_from_server()
 
-            await imap.login(self.email_server.user_name, self.email_server.password)
+            await imap.login(self.email_server.user_name, self.email_server.password.get_secret_value())
             await _send_imap_id(imap)
             await imap.select(_quote_mailbox(mailbox))
 
@@ -815,7 +815,7 @@ class EmailClient:
             use_tls=self.smtp_use_tls,
             tls_context=self._get_smtp_ssl_context(),
         ) as smtp:
-            await smtp.login(self.email_server.user_name, self.email_server.password)
+            await smtp.login(self.email_server.user_name, self.email_server.password.get_secret_value())
 
             # Create a combined list of all recipients for delivery
             all_recipients = recipients.copy()
@@ -898,7 +898,7 @@ class EmailClient:
         try:
             await imap._client_task
             await imap.wait_hello_from_server()
-            await imap.login(incoming_server.user_name, incoming_server.password)
+            await imap.login(incoming_server.user_name, incoming_server.password.get_secret_value())
             await _send_imap_id(imap)
 
             # Try to find Sent folder by IMAP \Sent flag first
@@ -961,7 +961,7 @@ class EmailClient:
         try:
             await imap._client_task
             await imap.wait_hello_from_server()
-            await imap.login(self.email_server.user_name, self.email_server.password)
+            await imap.login(self.email_server.user_name, self.email_server.password.get_secret_value())
             await _send_imap_id(imap)
             await imap.select(_quote_mailbox(mailbox))
 
