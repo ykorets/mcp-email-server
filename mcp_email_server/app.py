@@ -177,7 +177,7 @@ async def send_email(
 
 
 @mcp.tool(
-    description="Create a draft email and save it to the Drafts folder without sending. The draft will appear in the email client's Drafts folder, ready for the user to review and send manually. No SMTP required — this is a pure IMAP operation.",
+    description="Create a draft email and save it to the Drafts folder without sending. The draft will appear in the email client's Drafts folder, ready for the user to review and send manually. No SMTP required \u2014 this is a pure IMAP operation.",
 )
 async def create_draft(
     account_name: Annotated[str, Field(description="The name of the email account to create the draft in.")],
@@ -242,6 +242,26 @@ async def delete_emails(
     result = f"Successfully deleted {len(deleted_ids)} email(s)"
     if failed_ids:
         result += f", failed to delete {len(failed_ids)} email(s): {', '.join(failed_ids)}"
+    return result
+
+
+@mcp.tool(
+    description="Mark one or more emails as read (seen) by their email_id. Use list_emails_metadata first to get the email_id."
+)
+async def mark_as_read(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+    email_ids: Annotated[
+        list[str],
+        Field(description="List of email_id to mark as read (obtained from list_emails_metadata)."),
+    ],
+    mailbox: Annotated[str, Field(default="INBOX", description="The mailbox containing the emails.")] = "INBOX",
+) -> str:
+    handler = dispatch_handler(account_name)
+    marked_ids, failed_ids = await handler.mark_as_read(email_ids, mailbox)
+
+    result = f"Successfully marked {len(marked_ids)} email(s) as read"
+    if failed_ids:
+        result += f", failed to mark {len(failed_ids)} email(s): {', '.join(failed_ids)}"
     return result
 
 

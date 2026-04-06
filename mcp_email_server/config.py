@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import datetime
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -15,10 +17,49 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 
-from mcp_email_server.keychain import is_keychain_ref, resolve_keychain_password
 from mcp_email_server.log import logger
 
 DEFAULT_CONFIG_PATH = "~/.config/zerolib/mcp_email_server/config.toml"
+
+KEYCHAIN_PREFIX = "keychain:"
+KEYCHAIN_SERVICE = "mcp-email-server"
+
+
+def _resolve_keychain_password(account: str) -> str:
+    """Resolve a password from macOS Keychain.
+
+    Calls: security find-generic-password -s 'mcp-email-server' -a '<account>' -w
+    Returns the password string.
+    Raises RuntimeError if the lookup fails.
+    """
+    if sys.platform != "darwin":
+        raise RuntimeError(
+            f"Keychain password references ('{KEYCHAIN_PREFIX}') are only supported on macOS"
+        )
+    try:
+        result = subprocess.run(
+            [
+                "security",
+                "find-generic-password",
+                "-s", KEYCHAIN_SERVICE,
+                "-a", account,
+                "-w",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            raise RuntimeError(
+                f"Keychain lookup failed for account '{account}' "
+                f"(service='{KEYCHAIN_SERVICE}'): {stderr}"
+            )
+        return result.stdout.strip()
+    except FileNotFoundError:
+        raise RuntimeError("'security' command not found \u2014 are you on macOS?")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Keychain lookup timed out for account '{account}'")
 
 
 def _parse_bool_env(value: str | None, default: bool = False) -> bool:
@@ -26,22 +67,6 @@ def _parse_bool_env(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
     return value.lower() in ("true", "1", "yes", "on")
-
-
-def _resolve_password(password: SecretStr) -> SecretStr:
-    """Resolve a password that may be a Keychain reference.
-
-    If the password starts with 'keychain:', it is resolved from
-    macOS Keychain at startup. The actual password exists only in
-    process memory — never on disk in plaintext.
-
-    If the password is a regular string, it is returned as-is.
-    """
-    raw = password.get_secret_value()
-    if is_keychain_ref(raw):
-        resolved = resolve_keychain_password(raw)
-        return SecretStr(resolved)
-    return password
 
 
 CONFIG_PATH = Path(os.getenv("MCP_EMAIL_SERVER_CONFIG_PATH", DEFAULT_CONFIG_PATH)).expanduser().resolve()
@@ -55,22 +80,33 @@ class EmailServer(BaseModel):
     use_ssl: bool = True  # Usually port 465
     start_ssl: bool = False  # Usually port 587
     verify_ssl: bool = True  # Set to False for self-signed certificates (e.g., ProtonMail Bridge)
+    _keychain_ref: str | None = None  # Original "keychain:..." value for safe serialization
 
     @model_validator(mode="after")
     @classmethod
-    def resolve_keychain_passwords(cls, obj: EmailServer) -> EmailServer:
-        """Resolve keychain: references in passwords at model init time."""
-        obj.password = _resolve_password(obj.password)
+    def resolve_keychain_password(cls, obj: EmailServer) -> EmailServer:
+        """Resolve passwords that reference macOS Keychain.
+
+        If password starts with 'keychain:', the remainder is treated as the
+        Keychain account name and the real password is fetched at load time.
+        The original reference is preserved in _keychain_ref so that
+        serialization (store()) writes the reference, not the real password.
+        """
+        raw = obj.password.get_secret_value()
+        if raw.startswith(KEYCHAIN_PREFIX):
+            account = raw[len(KEYCHAIN_PREFIX):]
+            obj._keychain_ref = raw  # preserve original reference
+            real_password = _resolve_keychain_password(account)
+            obj.password = SecretStr(real_password)
+            logger.info(f"Resolved keychain password for account '{account}'")
         return obj
 
     @field_serializer("password")
     def serialize_password(self, v: SecretStr) -> str:
-        # When serializing back to TOML, preserve the keychain reference
-        # if one was originally used (don't write the resolved password)
-        raw = v.get_secret_value()
-        if is_keychain_ref(raw):
-            return raw
-        return raw
+        # If password came from keychain, serialize the reference, not the real password
+        if self._keychain_ref is not None:
+            return self._keychain_ref
+        return v.get_secret_value()
 
     def masked(self) -> EmailServer:
         return self.model_copy(update={"password": SecretStr("********")})
