@@ -1,0 +1,425 @@
+from __future__ import annotations
+
+import datetime
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import tomli_w
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_serializer, model_validator
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    TomlConfigSettingsSource,
+)
+
+from mcp_email_server.log import logger
+
+DEFAULT_CONFIG_PATH = "~/.config/zerolib/mcp_email_server/config.toml"
+
+KEYCHAIN_PREFIX = "keychain:"
+KEYCHAIN_SERVICE = "mcp-email-server"
+
+
+def _resolve_keychain_password(account: str) -> str:
+    """Resolve a password from macOS Keychain.
+
+    Calls: security find-generic-password -s 'mcp-email-server' -a '<account>' -w
+    Returns the password string.
+    Raises RuntimeError if the lookup fails.
+    """
+    if sys.platform != "darwin":
+        raise RuntimeError(
+            f"Keychain password references ('{KEYCHAIN_PREFIX}') are only supported on macOS"
+        )
+    try:
+        result = subprocess.run(
+            [
+                "security",
+                "find-generic-password",
+                "-s", KEYCHAIN_SERVICE,
+                "-a", account,
+                "-w",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            raise RuntimeError(
+                f"Keychain lookup failed for account '{account}' "
+                f"(service='{KEYCHAIN_SERVICE}'): {stderr}"
+            )
+        return result.stdout.strip()
+    except FileNotFoundError:
+        raise RuntimeError("'security' command not found — are you on macOS?")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Keychain lookup timed out for account '{account}'")
+
+
+def _parse_bool_env(value: str | None, default: bool = False) -> bool:
+    """Parse boolean value from environment variable."""
+    if value is None:
+        return default
+    return value.lower() in ("true", "1", "yes", "on")
+
+
+CONFIG_PATH = Path(os.getenv("MCP_EMAIL_SERVER_CONFIG_PATH", DEFAULT_CONFIG_PATH)).expanduser().resolve()
+
+
+class EmailServer(BaseModel):
+    user_name: str
+    password: SecretStr
+    host: str
+    port: int
+    use_ssl: bool = True  # Usually port 465
+    start_ssl: bool = False  # Usually port 587
+    verify_ssl: bool = True  # Set to False for self-signed certificates (e.g., ProtonMail Bridge)
+    _keychain_ref: str | None = None  # Original "keychain:..." value for safe serialization
+
+    @model_validator(mode="after")
+    @classmethod
+    def resolve_keychain_password(cls, obj: EmailServer) -> EmailServer:
+        """Resolve passwords that reference macOS Keychain.
+
+        If password starts with 'keychain:', the remainder is treated as the
+        Keychain account name and the real password is fetched at load time.
+        The original reference is preserved in _keychain_ref so that
+        serialization (store()) writes the reference, not the real password.
+        """
+        raw = obj.password.get_secret_value()
+        if raw.startswith(KEYCHAIN_PREFIX):
+            account = raw[len(KEYCHAIN_PREFIX):]
+            obj._keychain_ref = raw  # preserve original reference
+            real_password = _resolve_keychain_password(account)
+            obj.password = SecretStr(real_password)
+            logger.info(f"Resolved keychain password for account '{account}'")
+        return obj
+
+    @field_serializer("password")
+    def serialize_password(self, v: SecretStr) -> str:
+        # If password came from keychain, serialize the reference, not the real password
+        if self._keychain_ref is not None:
+            return self._keychain_ref
+        return v.get_secret_value()
+
+    def masked(self) -> EmailServer:
+        return self.model_copy(update={"password": SecretStr("********")})
+
+
+class AccountAttributes(BaseModel):
+    model_config = ConfigDict(json_encoders={datetime.datetime: lambda v: v.isoformat()})
+    account_name: str
+    description: str = ""
+    created_at: datetime.datetime = Field(default_factory=lambda: datetime.datetime.now(ZoneInfo("UTC")))
+    updated_at: datetime.datetime = Field(default_factory=lambda: datetime.datetime.now(ZoneInfo("UTC")))
+
+    @model_validator(mode="after")
+    @classmethod
+    def update_updated_at(cls, obj: AccountAttributes) -> AccountAttributes:
+        """Update updated_at field."""
+        # must disable validation to avoid infinite loop
+        obj.model_config["validate_assignment"] = False
+
+        # update updated_at field
+        obj.updated_at = datetime.datetime.now(ZoneInfo("UTC"))
+
+        # enable validation again
+        obj.model_config["validate_assignment"] = True
+        return obj
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, AccountAttributes):
+            return NotImplemented
+        return self.model_dump(exclude={"created_at", "updated_at"}) == other.model_dump(
+            exclude={"created_at", "updated_at"}
+        )
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_datetime(self, v: datetime.datetime) -> str:
+        return v.isoformat()
+
+    def masked(self) -> AccountAttributes:
+        return self.model_copy()
+
+
+class EmailSettings(AccountAttributes):
+    full_name: str
+    email_address: str
+    incoming: EmailServer
+    outgoing: EmailServer
+    save_to_sent: bool = True  # Save sent emails to IMAP Sent folder
+    sent_folder_name: str | None = None  # Override Sent folder name (auto-detect if None)
+
+    @classmethod
+    def init(
+        cls,
+        *,
+        account_name: str,
+        full_name: str,
+        email_address: str,
+        user_name: str,
+        password: str,
+        imap_host: str,
+        smtp_host: str,
+        imap_user_name: str | None = None,
+        imap_password: str | None = None,
+        imap_port: int = 993,
+        imap_ssl: bool = True,
+        imap_verify_ssl: bool = True,
+        smtp_port: int = 465,
+        smtp_ssl: bool = True,
+        smtp_start_ssl: bool = False,
+        smtp_verify_ssl: bool = True,
+        smtp_user_name: str | None = None,
+        smtp_password: str | None = None,
+        save_to_sent: bool = True,
+        sent_folder_name: str | None = None,
+    ) -> EmailSettings:
+        return cls(
+            account_name=account_name,
+            full_name=full_name,
+            email_address=email_address,
+            incoming=EmailServer(
+                user_name=imap_user_name or user_name,
+                password=imap_password or password,
+                host=imap_host,
+                port=imap_port,
+                use_ssl=imap_ssl,
+                verify_ssl=imap_verify_ssl,
+            ),
+            outgoing=EmailServer(
+                user_name=smtp_user_name or user_name,
+                password=smtp_password or password,
+                host=smtp_host,
+                port=smtp_port,
+                use_ssl=smtp_ssl,
+                start_ssl=smtp_start_ssl,
+                verify_ssl=smtp_verify_ssl,
+            ),
+            save_to_sent=save_to_sent,
+            sent_folder_name=sent_folder_name,
+        )
+
+    @classmethod
+    def from_env(cls) -> EmailSettings | None:
+        """Create EmailSettings from environment variables.
+
+        Expected environment variables:
+        - MCP_EMAIL_SERVER_ACCOUNT_NAME (default: "default")
+        - MCP_EMAIL_SERVER_FULL_NAME
+        - MCP_EMAIL_SERVER_EMAIL_ADDRESS
+        - MCP_EMAIL_SERVER_USER_NAME
+        - MCP_EMAIL_SERVER_PASSWORD
+        - MCP_EMAIL_SERVER_IMAP_HOST
+        - MCP_EMAIL_SERVER_IMAP_PORT (default: 993)
+        - MCP_EMAIL_SERVER_IMAP_SSL (default: true)
+        - MCP_EMAIL_SERVER_IMAP_VERIFY_SSL (default: true)
+        - MCP_EMAIL_SERVER_SMTP_HOST
+        - MCP_EMAIL_SERVER_SMTP_PORT (default: 465)
+        - MCP_EMAIL_SERVER_SMTP_SSL (default: true)
+        - MCP_EMAIL_SERVER_SMTP_START_SSL (default: false)
+        - MCP_EMAIL_SERVER_SMTP_VERIFY_SSL (default: true)
+        - MCP_EMAIL_SERVER_SAVE_TO_SENT (default: true)
+        - MCP_EMAIL_SERVER_SENT_FOLDER_NAME (default: auto-detect)
+        """
+        # Check if minimum required environment variables are set
+        email_address = os.getenv("MCP_EMAIL_SERVER_EMAIL_ADDRESS")
+        password = os.getenv("MCP_EMAIL_SERVER_PASSWORD")
+
+        if not email_address or not password:
+            return None
+
+        # Get all environment variables with defaults
+        account_name = os.getenv("MCP_EMAIL_SERVER_ACCOUNT_NAME", "default")
+        full_name = os.getenv("MCP_EMAIL_SERVER_FULL_NAME", email_address.split("@")[0])
+        user_name = os.getenv("MCP_EMAIL_SERVER_USER_NAME", email_address)
+        imap_host = os.getenv("MCP_EMAIL_SERVER_IMAP_HOST")
+        smtp_host = os.getenv("MCP_EMAIL_SERVER_SMTP_HOST")
+
+        # Required fields check
+        if not imap_host or not smtp_host:
+            logger.warning("Missing required email configuration environment variables (IMAP_HOST or SMTP_HOST)")
+            return None
+
+        try:
+            return cls.init(
+                account_name=account_name,
+                full_name=full_name,
+                email_address=email_address,
+                user_name=user_name,
+                password=password,
+                imap_host=imap_host,
+                imap_port=int(os.getenv("MCP_EMAIL_SERVER_IMAP_PORT", "993")),
+                imap_ssl=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_IMAP_SSL"), True),
+                imap_verify_ssl=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_IMAP_VERIFY_SSL"), True),
+                smtp_host=smtp_host,
+                smtp_port=int(os.getenv("MCP_EMAIL_SERVER_SMTP_PORT", "465")),
+                smtp_ssl=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_SMTP_SSL"), True),
+                smtp_start_ssl=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_SMTP_START_SSL"), False),
+                smtp_verify_ssl=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_SMTP_VERIFY_SSL"), True),
+                smtp_user_name=os.getenv("MCP_EMAIL_SERVER_SMTP_USER_NAME", user_name),
+                smtp_password=os.getenv("MCP_EMAIL_SERVER_SMTP_PASSWORD", password),
+                imap_user_name=os.getenv("MCP_EMAIL_SERVER_IMAP_USER_NAME", user_name),
+                imap_password=os.getenv("MCP_EMAIL_SERVER_IMAP_PASSWORD", password),
+                save_to_sent=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_SAVE_TO_SENT"), True),
+                sent_folder_name=os.getenv("MCP_EMAIL_SERVER_SENT_FOLDER_NAME"),
+            )
+        except (ValueError, TypeError) as e:
+            logger.error(f"Failed to create email settings from environment variables: {e}")
+            return None
+
+    def masked(self) -> EmailSettings:
+        return self.model_copy(
+            update={
+                "incoming": self.incoming.masked(),
+                "outgoing": self.outgoing.masked(),
+            }
+        )
+
+
+class ProviderSettings(AccountAttributes):
+    provider_name: str
+    api_key: SecretStr
+
+    @field_serializer("api_key")
+    def serialize_api_key(self, v: SecretStr) -> str:
+        return v.get_secret_value()
+
+    def masked(self) -> AccountAttributes:
+        return self.model_copy(update={"api_key": SecretStr("********")})
+
+
+class Settings(BaseSettings):
+    emails: list[EmailSettings] = []
+    providers: list[ProviderSettings] = []
+    db_location: str = CONFIG_PATH.with_name("db.sqlite3").as_posix()
+    enable_attachment_download: bool = False
+
+    model_config = SettingsConfigDict(toml_file=CONFIG_PATH, validate_assignment=True, revalidate_instances="always")
+
+    def __init__(self, **data: Any) -> None:
+        """Initialize Settings with support for environment variables."""
+        super().__init__(**data)
+
+        # Check for enable_attachment_download from environment variable
+        env_enable_attachment = os.getenv("MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD")
+        if env_enable_attachment is not None:
+            self.enable_attachment_download = _parse_bool_env(env_enable_attachment, False)
+            logger.info(f"Set enable_attachment_download={self.enable_attachment_download} from environment variable")
+
+        # Check for email configuration from environment variables
+        env_email = EmailSettings.from_env()
+        if env_email:
+            # Check if this account already exists (from TOML)
+            existing_account = None
+            for i, email in enumerate(self.emails):
+                if email.account_name == env_email.account_name:
+                    existing_account = i
+                    break
+
+            if existing_account is not None:
+                # Replace existing account with env configuration
+                self.emails[existing_account] = env_email
+                logger.info(f"Overriding email account '{env_email.account_name}' with environment variables")
+            else:
+                # Add new account from env
+                self.emails.insert(0, env_email)
+                logger.info(f"Added email account '{env_email.account_name}' from environment variables")
+
+    def add_email(self, email: EmailSettings) -> None:
+        """Use re-assigned for validation to work."""
+        self.emails = [email, *self.emails]
+
+    def add_provider(self, provider: ProviderSettings) -> None:
+        """Use re-assigned for validation to work."""
+        self.providers = [provider, *self.providers]
+
+    def delete_email(self, account_name: str) -> None:
+        """Use re-assigned for validation to work."""
+        self.emails = [email for email in self.emails if email.account_name != account_name]
+
+    def delete_provider(self, account_name: str) -> None:
+        """Use re-assigned for validation to work."""
+        self.providers = [provider for provider in self.providers if provider.account_name != account_name]
+
+    def get_account(self, account_name: str, masked: bool = False) -> EmailSettings | ProviderSettings | None:
+        for email in self.emails:
+            if email.account_name == account_name:
+                return email if not masked else email.masked()
+        for provider in self.providers:
+            if provider.account_name == account_name:
+                return provider if not masked else provider.masked()
+        return None
+
+    def get_accounts(self, masked: bool = False) -> list[EmailSettings | ProviderSettings]:
+        accounts = self.emails + self.providers
+        if masked:
+            return [account.masked() for account in accounts]
+        return accounts
+
+    @model_validator(mode="after")
+    @classmethod
+    def check_unique_account_names(cls, obj: Settings) -> Settings:
+        account_names = set()
+        for email in obj.emails:
+            if email.account_name in account_names:
+                raise ValueError(f"Duplicate account name {email.account_name}")
+            account_names.add(email.account_name)
+        for provider in obj.providers:
+            if provider.account_name in account_names:
+                raise ValueError(f"Duplicate account name {provider.account_name}")
+            account_names.add(provider.account_name)
+
+        return obj
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (TomlConfigSettingsSource(settings_cls),)
+
+    def _to_toml(self) -> str:
+        data = self.model_dump(exclude_none=True)
+        return tomli_w.dumps(data)
+
+    def store(self) -> None:
+        toml_file = self.model_config["toml_file"]
+        toml_file.parent.mkdir(parents=True, exist_ok=True)
+        toml_file.write_text(self._to_toml())
+        logger.info(f"Settings stored in {toml_file}")
+
+
+_settings = None
+
+
+def get_settings(reload: bool = False) -> Settings:
+    global _settings
+    if not _settings or reload:
+        logger.info(f"Loading settings from {CONFIG_PATH}")
+        _settings = Settings()
+    return _settings
+
+
+def store_settings(settings: Settings | None = None) -> None:
+    if not settings:
+        settings = get_settings()
+    settings.store()
+
+
+def delete_settings() -> None:
+    if not CONFIG_PATH.exists():
+        logger.info(f"Settings file {CONFIG_PATH} does not exist")
+        return
+    CONFIG_PATH.unlink()
+    logger.info(f"Deleted settings file {CONFIG_PATH}")
