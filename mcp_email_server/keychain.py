@@ -1,4 +1,4 @@
-"""macOS Keychain integration for secure password storage.
+"""macOS Keychain integration for secure password storage (READ-ONLY).
 
 Passwords in config.toml can use the format:
     password = "keychain:service_name/account_name"
@@ -7,6 +7,10 @@ This module resolves those references by calling the macOS
 `security` CLI tool. The actual password lives only in Keychain
 (encrypted, protected by biometrics or system password) and in
 process memory — never written to disk in plaintext.
+
+This module is intentionally READ-ONLY. It cannot write, update,
+or delete Keychain entries. Password management is done by the
+user via `security add-generic-password` or the setup script.
 
 On non-macOS systems, keychain references will raise an error
 with a clear message.
@@ -112,62 +116,10 @@ def resolve_keychain_password(ref: str) -> str:
     except subprocess.TimeoutExpired:
         msg = (
             f"Timeout reading from Keychain for service='{service}', "
-            f"account='{account}'. The Keychain may be locked — "
+            f"account='{account}'. The Keychain may be locked \u2014 "
             f"try unlocking it first."
         )
         raise RuntimeError(msg)
     except FileNotFoundError:
         msg = "macOS `security` command not found. Is this a macOS system?"
         raise RuntimeError(msg)
-
-
-def save_to_keychain(account: str, password: str, service: str = DEFAULT_SERVICE) -> bool:
-    """Save a password to macOS Keychain.
-
-    Args:
-        account: The account name (typically email address).
-        password: The password to store.
-        service: The service name (default: 'mcp-email-server').
-
-    Returns:
-        True if saved successfully.
-
-    Raises:
-        RuntimeError: If not on macOS or if save fails.
-    """
-    if platform.system() != "Darwin":
-        raise RuntimeError("Keychain is only available on macOS.")
-
-    try:
-        # First try to delete existing entry (ignore errors)
-        subprocess.run(
-            ["security", "delete-generic-password", "-s", service, "-a", account],
-            capture_output=True,
-            timeout=10,
-        )
-
-        # Add new entry
-        result = subprocess.run(
-            [
-                "security",
-                "add-generic-password",
-                "-s", service,
-                "-a", account,
-                "-w", password,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-        if result.returncode != 0:
-            msg = f"Failed to save to Keychain: {result.stderr.strip()}"
-            raise RuntimeError(msg)
-
-        logger.info(f"Saved password to Keychain: service='{service}', account='{account}'")
-        return True
-
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("Timeout saving to Keychain.")
-    except FileNotFoundError:
-        raise RuntimeError("macOS `security` command not found.")
