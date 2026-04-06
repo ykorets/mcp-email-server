@@ -1,270 +1,116 @@
-# mcp-email-server
+# mcp-email-server (ykorets fork)
 
-[![Release](https://img.shields.io/github/v/release/ai-zerolab/mcp-email-server)](https://img.shields.io/github/v/release/ai-zerolab/mcp-email-server)
-[![Build status](https://img.shields.io/github/actions/workflow/status/ai-zerolab/mcp-email-server/main.yml?branch=main)](https://github.com/ai-zerolab/mcp-email-server/actions/workflows/main.yml?query=branch%3Amain)
-[![codecov](https://codecov.io/gh/ai-zerolab/mcp-email-server/branch/main/graph/badge.svg)](https://codecov.io/gh/ai-zerolab/mcp-email-server)
-[![Commit activity](https://img.shields.io/github/commit-activity/m/ai-zerolab/mcp-email-server)](https://img.shields.io/github/commit-activity/m/ai-zerolab/mcp-email-server)
-[![License](https://img.shields.io/github/license/ai-zerolab/mcp-email-server)](https://img.shields.io/github/license/ai-zerolab/mcp-email-server)
-[![smithery badge](https://smithery.ai/badge/@ai-zerolab/mcp-email-server)](https://smithery.ai/server/@ai-zerolab/mcp-email-server)
+Fork of [ai-zerolab/mcp-email-server](https://github.com/ai-zerolab/mcp-email-server) with custom extensions for multi-account email management via Claude Desktop.
 
-IMAP and SMTP via MCP Server
+## What This Fork Adds
 
-- **Github repository**: <https://github.com/ai-zerolab/mcp-email-server/>
-- **Documentation** <https://ai-zerolab.github.io/mcp-email-server/>
+Three enhancements on top of the upstream MCP email server:
+
+### 1. `mark_as_read` Tool
+
+New MCP tool that marks emails as read (IMAP `\Seen` flag) by their UID.
+
+**Usage from Claude:**
+```
+mark_as_read(account_name="gmail-personal", email_ids=["154051", "154052"])
+```
+
+Files changed: `mcp_email_server/app.py`, `mcp_email_server/emails/classic.py`
+
+### 2. macOS Keychain Password Support
+
+Instead of storing plaintext passwords in `config.toml`, you can reference macOS Keychain entries:
+
+```toml
+[[emails]]
+account_name = "gmail-personal"
+
+[emails.incoming]
+password = "keychain:gmail-personal"
+```
+
+The server resolves `keychain:<account>` at startup by calling:
+```
+security find-generic-password -s 'mcp-email-server' -a '<account>' -w
+```
+
+To store a password in Keychain:
+```bash
+security add-generic-password -s 'mcp-email-server' -a 'gmail-personal' -w 'your-app-password'
+```
+
+The real password is never written back to `config.toml` — serialization preserves the `keychain:` reference.
+
+Files changed: `mcp_email_server/config.py`
+
+### 3. `create_draft` Tool
+
+Saves email drafts to the IMAP Drafts folder without sending. Already present in upstream — included here for completeness.
 
 ## Installation
 
-### Manual Installation
+This fork is installed from source on macOS:
 
-We recommend using [uv](https://github.com/astral-sh/uv) to manage your environment.
+```bash
+cd ~/Projects/mcp-email-server
+git pull
+pip3 install . --break-system-packages
+```
 
-Try `uvx mcp-email-server@latest ui` to config, and use following configuration for mcp client:
-
+Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 ```json
 {
   "mcpServers": {
-    "zerolib-email": {
-      "command": "uvx",
-      "args": ["mcp-email-server@latest", "stdio"]
-    }
-  }
-}
-```
-
-This package is available on PyPI, so you can install it using `pip install mcp-email-server`
-
-After that, configure your email server using the ui: `mcp-email-server ui`
-
-### Environment Variable Configuration
-
-You can also configure the email server using environment variables, which is particularly useful for CI/CD environments like Jenkins. zerolib-email supports both UI configuration (via TOML file) and environment variables, with environment variables taking precedence.
-
-```json
-{
-  "mcpServers": {
-    "zerolib-email": {
-      "command": "uvx",
-      "args": ["mcp-email-server@latest", "stdio"],
-      "env": {
-        "MCP_EMAIL_SERVER_ACCOUNT_NAME": "work",
-        "MCP_EMAIL_SERVER_FULL_NAME": "John Doe",
-        "MCP_EMAIL_SERVER_EMAIL_ADDRESS": "john@example.com",
-        "MCP_EMAIL_SERVER_USER_NAME": "john@example.com",
-        "MCP_EMAIL_SERVER_PASSWORD": "your_password",
-        "MCP_EMAIL_SERVER_IMAP_HOST": "imap.gmail.com",
-        "MCP_EMAIL_SERVER_IMAP_PORT": "993",
-        "MCP_EMAIL_SERVER_SMTP_HOST": "smtp.gmail.com",
-        "MCP_EMAIL_SERVER_SMTP_PORT": "465"
-      }
-    }
-  }
-}
-```
-
-#### Available Environment Variables
-
-| Variable                                      | Description                                            | Default       | Required |
-| --------------------------------------------- | ------------------------------------------------------ | ------------- | -------- |
-| `MCP_EMAIL_SERVER_ACCOUNT_NAME`               | Account identifier                                     | `"default"`   | No       |
-| `MCP_EMAIL_SERVER_FULL_NAME`                  | Display name                                           | Email prefix  | No       |
-| `MCP_EMAIL_SERVER_EMAIL_ADDRESS`              | Email address                                          | -             | Yes      |
-| `MCP_EMAIL_SERVER_USER_NAME`                  | Login username                                         | Same as email | No       |
-| `MCP_EMAIL_SERVER_PASSWORD`                   | Email password                                         | -             | Yes      |
-| `MCP_EMAIL_SERVER_IMAP_HOST`                  | IMAP server host                                       | -             | Yes      |
-| `MCP_EMAIL_SERVER_IMAP_PORT`                  | IMAP server port                                       | `993`         | No       |
-| `MCP_EMAIL_SERVER_IMAP_SSL`                   | Enable IMAP SSL                                        | `true`        | No       |
-| `MCP_EMAIL_SERVER_IMAP_VERIFY_SSL`            | Verify IMAP SSL certificates (disable for self-signed) | `true`        | No       |
-| `MCP_EMAIL_SERVER_SMTP_HOST`                  | SMTP server host                                       | -             | Yes      |
-| `MCP_EMAIL_SERVER_SMTP_PORT`                  | SMTP server port                                       | `465`         | No       |
-| `MCP_EMAIL_SERVER_SMTP_SSL`                   | Enable SMTP SSL                                        | `true`        | No       |
-| `MCP_EMAIL_SERVER_SMTP_START_SSL`             | Enable STARTTLS                                        | `false`       | No       |
-| `MCP_EMAIL_SERVER_SMTP_VERIFY_SSL`            | Verify SSL certificates (disable for self-signed)      | `true`        | No       |
-| `MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD` | Enable attachment download                             | `false`       | No       |
-| `MCP_EMAIL_SERVER_SAVE_TO_SENT`               | Save sent emails to IMAP Sent folder                   | `true`        | No       |
-| `MCP_EMAIL_SERVER_SENT_FOLDER_NAME`           | Custom Sent folder name (auto-detect if not set)       | -             | No       |
-
-### Enabling Attachment Downloads
-
-By default, downloading email attachments is disabled for security reasons. To enable this feature, you can either:
-
-**Option 1: Environment Variable**
-
-```json
-{
-  "mcpServers": {
-    "zerolib-email": {
-      "command": "uvx",
-      "args": ["mcp-email-server@latest", "stdio"],
-      "env": {
-        "MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD": "true"
-      }
-    }
-  }
-}
-```
-
-**Option 2: TOML Configuration**
-
-Add `enable_attachment_download = true` to your TOML configuration file (`~/.config/zerolib/mcp_email_server/config.toml`):
-
-```toml
-enable_attachment_download = true
-
-[[emails]]
-# ... your email configuration
-```
-
-Once enabled, you can use the `download_attachment` tool to save email attachments to a specified path.
-
-### Saving Sent Emails to IMAP Sent Folder
-
-By default, sent emails are automatically saved to your IMAP Sent folder. This ensures that emails sent via the MCP server appear in your email client (Thunderbird, webmail, etc.).
-
-The server auto-detects common Sent folder names: `Sent`, `INBOX.Sent`, `Sent Items`, `Sent Mail`, `[Gmail]/Sent Mail`.
-
-**To specify a custom Sent folder name** (useful for providers with non-standard folder names):
-
-**Option 1: Environment Variable**
-
-```json
-{
-  "mcpServers": {
-    "zerolib-email": {
-      "command": "uvx",
-      "args": ["mcp-email-server@latest", "stdio"],
-      "env": {
-        "MCP_EMAIL_SERVER_SENT_FOLDER_NAME": "INBOX.Sent"
-      }
-    }
-  }
-}
-```
-
-**Option 2: TOML Configuration**
-
-```toml
-[[emails]]
-account_name = "work"
-save_to_sent = true
-sent_folder_name = "INBOX.Sent"
-# ... rest of your email configuration
-```
-
-**To disable saving to Sent folder**, set `MCP_EMAIL_SERVER_SAVE_TO_SENT=false` or `save_to_sent = false` in your TOML config.
-
-### Self-Signed Certificates (e.g., ProtonMail Bridge)
-
-If you're using a local mail server with self-signed certificates (like ProtonMail Bridge), you'll need to disable SSL certificate verification:
-
-```json
-{
-  "mcpServers": {
-    "zerolib-email": {
-      "command": "uvx",
-      "args": ["mcp-email-server@latest", "stdio"],
-      "env": {
-        "MCP_EMAIL_SERVER_IMAP_VERIFY_SSL": "false",
-        "MCP_EMAIL_SERVER_SMTP_VERIFY_SSL": "false"
-      }
-    }
-  }
-}
-```
-
-Or in TOML configuration:
-
-```toml
-[[emails]]
-account_name = "protonmail"
-# ... other settings ...
-
-[emails.incoming]
-verify_ssl = false
-
-[emails.outgoing]
-verify_ssl = false
-```
-
-For separate IMAP/SMTP credentials, you can also use:
-
-- `MCP_EMAIL_SERVER_IMAP_USER_NAME` / `MCP_EMAIL_SERVER_IMAP_PASSWORD`
-- `MCP_EMAIL_SERVER_SMTP_USER_NAME` / `MCP_EMAIL_SERVER_SMTP_PASSWORD`
-
-Then you can try it in [Claude Desktop](https://claude.ai/download). If you want to intergrate it with other mcp client, run `$which mcp-email-server` for the path and configure it in your client like:
-
-```json
-{
-  "mcpServers": {
-    "zerolib-email": {
-      "command": "{{ ENTRYPOINT }}",
+    "email": {
+      "command": "mcp-email-server",
       "args": ["stdio"]
     }
   }
 }
 ```
 
-If `docker` is avaliable, you can try use docker image, but you may need to config it in your client using `tools` via `MCP`. The default config path is `~/.config/zerolib/mcp_email_server/config.toml`
+After installing, restart Claude Desktop to pick up the new tools.
 
-```json
-{
-  "mcpServers": {
-    "zerolib-email": {
-      "command": "docker",
-      "args": ["run", "-it", "ghcr.io/ai-zerolab/mcp-email-server:latest"]
-    }
-  }
-}
-```
+## Patching Workflow
 
-### Installing via Smithery
+When Claude makes changes to MCP server code, the established deployment method is:
 
-To install Email Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@ai-zerolab/mcp-email-server):
+**For small files** — push via GitHub API (`mcp__github__push_files`), then `git pull` locally.
+
+**For large files** (>40KB, e.g. `classic.py`) — use a heredoc Python patch script:
 
 ```bash
-npx -y @smithery/cli install @ai-zerolab/mcp-email-server --client claude
+python3 << 'PATCH'
+import pathlib
+p = pathlib.Path('mcp_email_server/emails/classic.py')
+s = p.read_text()
+if 'target_function' in s:
+    print('Already patched'); exit()
+# ... string replacement logic ...
+p.write_text(s)
+print('Patched!')
+PATCH
 ```
 
-## Usage
-
-### Replying to Emails
-
-To reply to an email with proper threading (so it appears in the same conversation in email clients):
-
-1. First, fetch the original email to get its `message_id`:
-
-```python
-emails = await get_emails_content(account_name="work", email_ids=["123"])
-original = emails.emails[0]
+**Full deploy sequence:**
+```bash
+cd ~/Projects/mcp-email-server
+git pull                                    # get small file changes
+python3 << 'PATCH' ... PATCH                # apply large file patches (if any)
+pip3 install . --break-system-packages      # reinstall
+# Restart Claude Desktop
 ```
 
-2. Send your reply using `in_reply_to` and `references`:
+## Configuration
 
-```python
-await send_email(
-    account_name="work",
-    recipients=[original.sender],
-    subject=f"Re: {original.subject}",
-    body="Thank you for your email...",
-    in_reply_to=original.message_id,
-    references=original.message_id,
-)
-```
+Email accounts are configured in `~/.config/zerolib/mcp_email_server/config.toml`. This fork supports 11 accounts with Keychain-backed passwords.
 
-The `in_reply_to` parameter sets the `In-Reply-To` header, and `references` sets the `References` header. Both are used by email clients to thread conversations properly.
+See the [upstream README](https://github.com/ai-zerolab/mcp-email-server#readme) for full configuration options including environment variables, SSL settings, attachment downloads, and SMTP configuration.
 
-## Development
+## Upstream
 
-This project is managed using [uv](https://github.com/ai-zerolab/uv).
+All original features from [ai-zerolab/mcp-email-server](https://github.com/ai-zerolab/mcp-email-server) are preserved: IMAP/SMTP via MCP, multi-account support, email threading, attachment downloads, self-signed certificate support, and more.
 
-Try `make install` to install the virtual environment and install the pre-commit hooks.
+## License
 
-Use `uv run mcp-email-server` for local development.
-
-## Releasing a new version
-
-- Create an API Token on [PyPI](https://pypi.org/).
-- Add the API Token to your projects secrets with the name `PYPI_TOKEN` by visiting [this page](https://github.com/ai-zerolab/mcp-email-server/settings/secrets/actions/new).
-- Create a [new release](https://github.com/ai-zerolab/mcp-email-server/releases/new) on Github.
-- Create a new tag in the form `*.*.*`.
-
-For more details, see [here](https://fpgmaas.github.io/cookiecutter-uv/features/cicd/#how-to-trigger-a-release).
+Same as upstream — see [LICENSE](LICENSE).
