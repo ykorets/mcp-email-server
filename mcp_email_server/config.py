@@ -15,6 +15,7 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 
+from mcp_email_server.keychain import is_keychain_ref, resolve_keychain_password
 from mcp_email_server.log import logger
 
 DEFAULT_CONFIG_PATH = "~/.config/zerolib/mcp_email_server/config.toml"
@@ -25,6 +26,22 @@ def _parse_bool_env(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
     return value.lower() in ("true", "1", "yes", "on")
+
+
+def _resolve_password(password: SecretStr) -> SecretStr:
+    """Resolve a password that may be a Keychain reference.
+
+    If the password starts with 'keychain:', it is resolved from
+    macOS Keychain at startup. The actual password exists only in
+    process memory — never on disk in plaintext.
+
+    If the password is a regular string, it is returned as-is.
+    """
+    raw = password.get_secret_value()
+    if is_keychain_ref(raw):
+        resolved = resolve_keychain_password(raw)
+        return SecretStr(resolved)
+    return password
 
 
 CONFIG_PATH = Path(os.getenv("MCP_EMAIL_SERVER_CONFIG_PATH", DEFAULT_CONFIG_PATH)).expanduser().resolve()
@@ -39,9 +56,21 @@ class EmailServer(BaseModel):
     start_ssl: bool = False  # Usually port 587
     verify_ssl: bool = True  # Set to False for self-signed certificates (e.g., ProtonMail Bridge)
 
+    @model_validator(mode="after")
+    @classmethod
+    def resolve_keychain_passwords(cls, obj: EmailServer) -> EmailServer:
+        """Resolve keychain: references in passwords at model init time."""
+        obj.password = _resolve_password(obj.password)
+        return obj
+
     @field_serializer("password")
     def serialize_password(self, v: SecretStr) -> str:
-        return v.get_secret_value()
+        # When serializing back to TOML, preserve the keychain reference
+        # if one was originally used (don't write the resolved password)
+        raw = v.get_secret_value()
+        if is_keychain_ref(raw):
+            return raw
+        return raw
 
     def masked(self) -> EmailServer:
         return self.model_copy(update={"password": SecretStr("********")})
