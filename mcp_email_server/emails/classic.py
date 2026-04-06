@@ -20,6 +20,7 @@ import aiosmtplib
 
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails import EmailHandler
+from mcp_email_server.emails.drafts import append_to_drafts, compose_draft_message
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
@@ -47,8 +48,8 @@ def _quote_mailbox(mailbox: str) -> str:
     """
     # Per RFC 3501, literal double-quote characters in a quoted string must
     # be escaped with a backslash. Backslashes themselves must also be escaped.
-    escaped = mailbox.replace("\\", "\\\\").replace('"', r"\"")
-    return f'"{escaped}"'
+    escaped = mailbox.replace("\\", "\\\\").replace('"', r'\"')
+    return f'"{ escaped}"'
 
 
 async def _send_imap_id(imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL) -> None:
@@ -171,7 +172,7 @@ class EmailClient:
             # Remove script and style elements
             text = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
             # Convert common block elements to newlines
-            text = re.sub(r"<(br|p|div|tr|li)[^>]*/?>", "\n", text, flags=re.IGNORECASE)
+            text = re.sub(r"<(br|p|div|tr|li)[^>]*/?>" , "\n", text, flags=re.IGNORECASE)
             # Remove all remaining HTML tags
             text = re.sub(r"<[^>]+>", "", text)
             # Decode common HTML entities
@@ -1106,6 +1107,59 @@ class ClassicEmailHandler(EmailHandler):
                 )
             except Exception as e:
                 logger.error(f"Failed to save email to Sent folder: {e}", exc_info=True)
+
+    async def create_draft(
+        self,
+        recipients: list[str],
+        subject: str,
+        body: str,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        html: bool = False,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+    ) -> str:
+        """Create a draft email and save it to the Drafts folder via IMAP APPEND.
+
+        This is a pure IMAP operation — no SMTP connection is required.
+        The draft will appear in the email client's Drafts folder, ready
+        for the user to review and send manually.
+
+        Args:
+            recipients: List of recipient email addresses.
+            subject: Email subject.
+            body: Email body content.
+            cc: List of CC email addresses.
+            bcc: List of BCC email addresses.
+            html: Whether the body is HTML.
+            in_reply_to: Message-ID for reply threading.
+            references: Space-separated Message-IDs for thread chain.
+
+        Returns:
+            A success message indicating which folder the draft was saved to.
+        """
+        sender = f"{self.email_settings.full_name} <{self.email_settings.email_address}>"
+
+        # Compose the draft message
+        msg = compose_draft_message(
+            sender=sender,
+            recipients=recipients,
+            subject=subject,
+            body=body,
+            cc=cc,
+            bcc=bcc,
+            html=html,
+            in_reply_to=in_reply_to,
+            references=references,
+        )
+
+        # Save to Drafts folder via IMAP APPEND
+        folder = await append_to_drafts(
+            msg=msg,
+            incoming_server=self.email_settings.incoming,
+        )
+
+        return f"Draft saved to '{folder}' folder for {self.email_settings.email_address}"
 
     async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
         """Delete emails by their UIDs. Returns (deleted_ids, failed_ids)."""
