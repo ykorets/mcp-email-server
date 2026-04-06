@@ -80,6 +80,35 @@ class EmailHandler(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def create_draft(
+        self,
+        recipients: list[str],
+        subject: str,
+        body: str,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        html: bool = False,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+    ) -> str:
+        """
+        Create a draft email and save it to the IMAP Drafts folder without sending.
+
+        Args:
+            recipients: List of recipient email addresses.
+            subject: Email subject.
+            body: Email body content.
+            cc: List of CC email addresses.
+            bcc: List of BCC email addresses.
+            html: Whether the body is HTML (True) or plain text (False).
+            in_reply_to: Message-ID of the email being replied to (for threading).
+            references: Space-separated Message-IDs for the thread chain.
+
+        Returns:
+            A string message indicating success and the folder where the draft was saved.
+        """
+
+    @abc.abstractmethod
     async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
         """
         Delete emails by their IDs. Returns (deleted_ids, failed_ids)
