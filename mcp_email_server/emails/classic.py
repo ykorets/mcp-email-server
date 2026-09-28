@@ -21,6 +21,7 @@ import aiosmtplib
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails import EmailHandler
 from mcp_email_server.emails.drafts import append_to_drafts, compose_draft_message
+from mcp_email_server.emails.reliability import close_imap, login_imap
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
@@ -113,8 +114,8 @@ class EmailClient:
         """Create a new IMAP connection with the configured SSL context."""
         if self.email_server.use_ssl:
             imap_ssl_context = _create_ssl_context(self.email_server.verify_ssl)
-            return self.imap_class(self.email_server.host, self.email_server.port, ssl_context=imap_ssl_context)
-        return self.imap_class(self.email_server.host, self.email_server.port)
+            return self.imap_class(self.email_server.host, self.email_server.port, ssl_context=imap_ssl_context, timeout=15)
+        return self.imap_class(self.email_server.host, self.email_server.port, timeout=15)
 
     def _get_smtp_ssl_context(self) -> ssl.SSLContext | None:
         """Get SSL context for SMTP connections based on verify_ssl setting."""
@@ -429,12 +430,7 @@ class EmailClient:
     ) -> int:
         imap = self._imap_connect()
         try:
-            # Wait for the connection to be established
-            await imap._client_task
-            await imap.wait_hello_from_server()
-
-            # Login and select inbox
-            await imap.login(self.email_server.user_name, self.email_server.password.get_secret_value())
+            await login_imap(imap, self.email_server)
             await _send_imap_id(imap)
             await imap.select(_quote_mailbox(mailbox))
             search_criteria = self._build_search_criteria(
@@ -453,10 +449,7 @@ class EmailClient:
             return len(messages[0].split())
         finally:
             # Ensure we logout properly
-            try:
-                await imap.logout()
-            except Exception as e:
-                logger.info(f"Error during logout: {e}")
+            await close_imap(imap)
 
     async def get_emails_metadata_stream(
         self,
@@ -475,12 +468,7 @@ class EmailClient:
     ) -> AsyncGenerator[dict[str, Any], None]:
         imap = self._imap_connect()
         try:
-            # Wait for the connection to be established
-            await imap._client_task
-            await imap.wait_hello_from_server()
-
-            # Login and select mailbox
-            await imap.login(self.email_server.user_name, self.email_server.password.get_secret_value())
+            await login_imap(imap, self.email_server)
             await _send_imap_id(imap)
             await imap.select(_quote_mailbox(mailbox))
 
@@ -538,10 +526,7 @@ class EmailClient:
                 if uid in metadata_by_uid:
                     yield metadata_by_uid[uid]
         finally:
-            try:
-                await imap.logout()
-            except Exception as e:
-                logger.info(f"Error during logout: {e}")
+            await close_imap(imap)
 
     def _check_email_content(self, data: list) -> bool:
         """Check if the fetched data contains actual email content."""
@@ -572,7 +557,8 @@ class EmailClient:
 
     async def _fetch_email_with_formats(self, imap, email_id: str) -> list | None:
         """Try different fetch formats to get email data."""
-        fetch_formats = ["RFC822", "BODY[]", "BODY.PEEK[]", "(BODY.PEEK[])"]
+        # RFC822 and BODY[] silently set \\Seen. Reading must preserve flags.
+        fetch_formats = ["BODY.PEEK[]", "(BODY.PEEK[])"]
 
         for fetch_format in fetch_formats:
             try:
@@ -589,12 +575,7 @@ class EmailClient:
     async def get_email_body_by_id(self, email_id: str, mailbox: str = "INBOX") -> dict[str, Any] | None:
         imap = self._imap_connect()
         try:
-            # Wait for the connection to be established
-            await imap._client_task
-            await imap.wait_hello_from_server()
-
-            # Login and select inbox
-            await imap.login(self.email_server.user_name, self.email_server.password.get_secret_value())
+            await login_imap(imap, self.email_server)
             await _send_imap_id(imap)
             await imap.select(_quote_mailbox(mailbox))
 
@@ -619,10 +600,7 @@ class EmailClient:
 
         finally:
             # Ensure we logout properly
-            try:
-                await imap.logout()
-            except Exception as e:
-                logger.info(f"Error during logout: {e}")
+            await close_imap(imap)
 
     async def download_attachment(
         self,
@@ -644,10 +622,7 @@ class EmailClient:
         """
         imap = self._imap_connect()
         try:
-            await imap._client_task
-            await imap.wait_hello_from_server()
-
-            await imap.login(self.email_server.user_name, self.email_server.password.get_secret_value())
+            await login_imap(imap, self.email_server)
             await _send_imap_id(imap)
             await imap.select(_quote_mailbox(mailbox))
 
@@ -701,10 +676,7 @@ class EmailClient:
             }
 
         finally:
-            try:
-                await imap.logout()
-            except Exception as e:
-                logger.info(f"Error during logout: {e}")
+            await close_imap(imap)
 
     def _validate_attachment(self, file_path: str) -> Path:
         """Validate attachment file path."""
@@ -976,10 +948,7 @@ class EmailClient:
 
             await imap.expunge()
         finally:
-            try:
-                await imap.logout()
-            except Exception as e:
-                logger.info(f"Error during logout: {e}")
+            await close_imap(imap)
 
         return deleted_ids, failed_ids
 
@@ -1001,10 +970,7 @@ class EmailClient:
                     logger.error(f"Failed to mark email {email_id} as read: {e}")
                     failed_ids.append(email_id)
         finally:
-            try:
-                await imap.logout()
-            except Exception as e:
-                logger.info(f"Error during logout: {e}")
+            await close_imap(imap)
         return marked_ids, failed_ids
 
 
