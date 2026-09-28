@@ -11,6 +11,7 @@ from mcp_email_server.config import (
     get_settings,
 )
 from mcp_email_server.emails.dispatcher import dispatch_handler
+from mcp_email_server.emails.health import check_accounts
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailContentBatchResponse,
@@ -30,6 +31,17 @@ async def get_account(account_name: str) -> EmailSettings | ProviderSettings | N
 async def list_available_accounts() -> list[AccountAttributes]:
     settings = get_settings()
     return [account.masked() for account in settings.get_accounts()]
+
+
+@mcp.tool(description="Check IMAP access to every configured mailbox, or selected accounts. Read-only: no messages fetched, sent, deleted, or marked read. Reports failures separately; SMTP is not tested.")
+async def check_accounts_health(account_names: list[str] | None = None) -> dict:
+    accounts = get_settings().get_accounts()
+    if account_names is not None:
+        known = {a.account_name for a in accounts}
+        if set(account_names) - known:
+            raise ValueError("Unknown account name. Use list_available_accounts first.")
+        accounts = [a for a in accounts if a.account_name in account_names]
+    return await check_accounts(accounts)
 
 
 @mcp.tool(description="Add a new email account configuration to the settings.")
