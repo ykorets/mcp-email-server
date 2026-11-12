@@ -367,3 +367,49 @@ async def test_corrupt_or_mismatched_inbound_files_fail_closed(email_server, pay
     with patch.object(client, "_imap_connect", return_value=imap), pytest.raises(ValueError, match=reason):
         await client.get_attachment("42", "1")
     imap.logout.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload,encoding,declared_size,accepted",
+    [
+        (b"aGVsbG8=\r\n", "base64", 9, True),
+        (b"aGVs\r\n", "base64", 9, False),
+        (b"aGVs\rbG8=\r\n", "base64", 10, False),
+        (b"aGVs\nbG8=\r\n", "base64", 10, False),
+        (b"hello\r\n", "7bit", 6, False),
+    ],
+)
+async def test_gmail_lf_size_exception_is_only_complete_base64_crlf(
+    email_server, payload, encoding, declared_size, accepted
+):
+    client = EmailClient(email_server)
+    imap = AsyncMock()
+    imap._client_task = asyncio.get_running_loop().create_future()
+    imap._client_task.set_result(None)
+    imap.login.return_value = imap.select.return_value = ("OK", [])
+    imap.id.return_value = SimpleNamespace(result="OK")
+    tree = PDF.replace(" 8 NIL", f" {declared_size} NIL")
+    imap.uid.side_effect = [
+        ("OK", [f"1 FETCH (UID 42 BODYSTRUCTURE {tree})".encode()]),
+        ("OK", [bytearray(payload)]),
+        ("OK", [bytearray(f"Content-Type: application/pdf\r\nContent-Transfer-Encoding: {encoding}\r\n".encode())]),
+    ]
+    with patch.object(client, "_imap_connect", return_value=imap):
+        if accepted:
+            assert (await client.get_attachment("42", "1")).data == b"hello"
+        else:
+            with pytest.raises(ValueError, match="size differs"):
+                await client.get_attachment("42", "1")
+
+
+def test_draft_limit_counts_actual_crlf_wire_size(monkeypatch):
+    from email.policy import SMTP
+
+    args = ("from@example.invalid", ["to@example.invalid"], "subject", "body")
+    msg = compose_draft_message(*args)
+    # This fits under the old LF-based check but exceeds the actual SMTP wire size.
+    monkeypatch.setattr("mcp_email_server.emails.drafts.MAX_MESSAGE_BYTES", len(msg.as_bytes()))
+    assert len(msg.as_bytes(policy=SMTP)) > len(msg.as_bytes())
+    with pytest.raises(ValueError, match="Encoded"):
+        compose_draft_message(*args)

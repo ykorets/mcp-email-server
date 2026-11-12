@@ -19,6 +19,12 @@ integrations; new remote clients should use the transfer tools below.
 inside the mailbox's Drafts folder. A mail client can open and send that draft.
 It does not send SMTP mail. Bcc and reply/thread headers remain in the draft;
 SMTP sending puts Bcc recipients only in the delivery envelope.
+IMAP drafts and Sent copies serialize with standard SMTP CRLF line endings; the
+encoded-message limit counts those actual wire bytes. For older LF-only messages,
+Gmail can report an LF-based BODYSTRUCTURE size and return the part with CRLF.
+Retrieval accepts that exact reversible size difference only for valid base64
+whose line endings are uniformly CRLF. Truncation, mixed/bare-CR lines and other
+size mismatches still fail closed. Decoded file bytes and SHA-256 are unchanged.
 An attached `.eml` with MIME type `message/rfc822` is composed as a nested message
 under RFC 2046, preserving its message structure rather than using invalid
 base64 message encoding. Mail serialization can normalize its line endings.
