@@ -11,6 +11,7 @@ Three enhancements on top of the upstream MCP email server:
 New MCP tool that marks emails as read (IMAP `\Seen` flag) by their UID.
 
 **Usage from Claude:**
+
 ```
 mark_as_read(account_name="gmail-personal", email_ids=["154051", "154052"])
 ```
@@ -30,11 +31,13 @@ password = "keychain:gmail-personal"
 ```
 
 The server resolves `keychain:<account>` at startup by calling:
+
 ```
 security find-generic-password -s 'mcp-email-server' -a '<account>' -w
 ```
 
 To store a password in Keychain:
+
 ```bash
 security add-generic-password -s 'mcp-email-server' -a 'gmail-personal' -w 'your-app-password'
 ```
@@ -58,6 +61,7 @@ pip3 install . --break-system-packages
 ```
 
 Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
 ```json
 {
   "mcpServers": {
@@ -93,6 +97,7 @@ PATCH
 ```
 
 **Full deploy sequence:**
+
 ```bash
 cd ~/Projects/mcp-email-server
 git pull                                    # get small file changes
@@ -114,3 +119,9 @@ All original features from [ai-zerolab/mcp-email-server](https://github.com/ai-z
 ## License
 
 Same as upstream — see [LICENSE](LICENSE).
+
+# Remote attachments
+
+Remote clients can upload and receive file bytes through MCP and attach them to
+IMAP drafts or approved outgoing mail. See [the attachment protocol](docs/attachments.md)
+for tools, limits, temporary-memory custody and the trusted proxy contract.

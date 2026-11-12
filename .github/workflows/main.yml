@@ -9,6 +9,7 @@ on:
 
 jobs:
   quality:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     steps:
       - name: Check out
@@ -26,6 +27,7 @@ jobs:
         run: make check
 
   tests-and-type-check:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -51,6 +53,7 @@ jobs:
         if: ${{ matrix.python-version == '3.12' }}
 
   check-docs:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     steps:
       - name: Check out
