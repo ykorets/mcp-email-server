@@ -1065,7 +1065,6 @@ source = { editable = "." }
 dependencies = [
     { name = "aioimaplib" },
     { name = "aiosmtplib" },
-    { name = "gradio" },
     { name = "jinja2" },
     { name = "loguru" },
     { name = "mcp", extra = ["cli"] },
@@ -1073,6 +1072,11 @@ dependencies = [
     { name = "pydantic-settings", extra = ["toml"] },
     { name = "tomli-w" },
     { name = "typer" },
+]
+
+[package.optional-dependencies]
+ui = [
+    { name = "gradio" },
 ]
 
 [package.dev-dependencies]
@@ -1093,7 +1097,7 @@ dev = [
 requires-dist = [
     { name = "aioimaplib", specifier = ">=2.0.1" },
     { name = "aiosmtplib", specifier = ">=4.0.0" },
-    { name = "gradio", specifier = ">=6.0.1" },
+    { name = "gradio", marker = "extra == 'ui'", specifier = ">=6.0.1" },
     { name = "jinja2", specifier = ">=3.1.5" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.23.0,<2" },
@@ -1102,6 +1106,7 @@ requires-dist = [
     { name = "tomli-w", specifier = ">=1.2.0" },
     { name = "typer", specifier = ">=0.15.1" },
 ]
+provides-extras = ["ui"]
 
 [package.metadata.requires-dev]
 dev = [

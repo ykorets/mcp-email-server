@@ -125,3 +125,7 @@ Same as upstream — see [LICENSE](LICENSE).
 Remote clients can upload and receive file bytes through MCP and attach them to
 IMAP drafts or approved outgoing mail. See [the attachment protocol](docs/attachments.md)
 for tools, limits, temporary-memory custody and the trusted proxy contract.
+
+### Headless server and optional setup UI
+
+The MCP/IMAP/SMTP runtime does not require Gradio, image codecs or data-analysis libraries. The setup UI is an optional extra: install `mcp-email-server[ui]` when using the `ui` command. The existing locked Cloudflare image remains unchanged by this source-only packaging change.

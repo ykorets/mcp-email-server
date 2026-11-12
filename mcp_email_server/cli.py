@@ -35,7 +35,13 @@ def streamable_http(
 
 @app.command()
 def ui():
-    from mcp_email_server.ui import main as ui_main
+    try:
+        from mcp_email_server.ui import main as ui_main
+    except ModuleNotFoundError as exc:
+        if exc.name != "gradio":
+            raise
+        typer.echo("The optional UI is not installed. Install mcp-email-server[ui] to use this command.")
+        raise typer.Exit(code=2) from None
 
     ui_main()
 
