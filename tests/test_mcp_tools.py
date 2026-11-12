@@ -394,7 +394,7 @@ class TestMcpTools:
     async def test_delete_emails(self):
         """Test delete_emails MCP tool."""
         mock_handler = AsyncMock()
-        mock_handler.delete_emails.return_value = (["12345", "12346"], [])
+        mock_handler.move_to_trash.return_value = (["12345", "12346"], [])
 
         with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
             result = await delete_emails(
@@ -402,14 +402,14 @@ class TestMcpTools:
                 email_ids=["12345", "12346"],
             )
 
-            assert result == "Successfully deleted 2 email(s)"
-            mock_handler.delete_emails.assert_called_once_with(["12345", "12346"], "INBOX")
+            assert result == "Successfully moved 2 email(s) to Trash"
+            mock_handler.move_to_trash.assert_called_once_with(["12345", "12346"], "INBOX")
 
     @pytest.mark.asyncio
     async def test_delete_emails_with_failures(self):
         """Test delete_emails MCP tool with some failures."""
         mock_handler = AsyncMock()
-        mock_handler.delete_emails.return_value = (["12345"], ["12346", "12347"])
+        mock_handler.move_to_trash.return_value = (["12345"], ["12346", "12347"])
 
         with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
             result = await delete_emails(
@@ -417,14 +417,17 @@ class TestMcpTools:
                 email_ids=["12345", "12346", "12347"],
             )
 
-            assert result == "Successfully deleted 1 email(s), failed to delete 2 email(s): 12346, 12347"
-            mock_handler.delete_emails.assert_called_once_with(["12345", "12346", "12347"], "INBOX")
+            assert (
+                result
+                == "Successfully moved 1 email(s) to Trash, not confirmed moved; reconcile before retrying 2 email(s): 12346, 12347"
+            )
+            mock_handler.move_to_trash.assert_called_once_with(["12345", "12346", "12347"], "INBOX")
 
     @pytest.mark.asyncio
     async def test_delete_emails_with_mailbox(self):
         """Test delete_emails MCP tool with custom mailbox."""
         mock_handler = AsyncMock()
-        mock_handler.delete_emails.return_value = (["12345"], [])
+        mock_handler.move_to_trash.return_value = (["12345"], [])
 
         with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
             result = await delete_emails(
@@ -433,8 +436,8 @@ class TestMcpTools:
                 mailbox="Trash",
             )
 
-            assert result == "Successfully deleted 1 email(s)"
-            mock_handler.delete_emails.assert_called_once_with(["12345"], "Trash")
+            assert result == "Successfully moved 1 email(s) to Trash"
+            mock_handler.move_to_trash.assert_called_once_with(["12345"], "Trash")
 
     @pytest.mark.asyncio
     async def test_download_attachment_disabled(self):
