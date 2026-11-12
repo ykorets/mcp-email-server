@@ -45,7 +45,7 @@ def _parse_keychain_ref(ref: str) -> tuple[str, str]:
     Returns:
         Tuple of (service_name, account_name)
     """
-    path = ref[len(KEYCHAIN_PREFIX):]
+    path = ref[len(KEYCHAIN_PREFIX) :]
     if "/" in path:
         service, account = path.split("/", 1)
         return service, account
@@ -79,12 +79,14 @@ def resolve_keychain_password(ref: str) -> str:
     service, account = _parse_keychain_ref(ref)
 
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: S603 - fixed system executable and argv, never a shell
             [
-                "security",
+                "/usr/bin/security",
                 "find-generic-password",
-                "-s", service,
-                "-a", account,
+                "-s",
+                service,
+                "-a",
+                account,
                 "-w",  # output only the password
             ],
             capture_output=True,
@@ -104,22 +106,19 @@ def resolve_keychain_password(ref: str) -> str:
 
         password = result.stdout.strip()
         if not password:
-            msg = (
-                f"Empty password returned from Keychain for "
-                f"service='{service}', account='{account}'"
-            )
+            msg = f"Empty password returned from Keychain for service='{service}', account='{account}'"
             raise RuntimeError(msg)
 
         logger.info(f"Resolved password from Keychain: service='{service}', account='{account}'")
         return password
 
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         msg = (
             f"Timeout reading from Keychain for service='{service}', "
             f"account='{account}'. The Keychain may be locked \u2014 "
             f"try unlocking it first."
         )
-        raise RuntimeError(msg)
-    except FileNotFoundError:
+        raise RuntimeError(msg) from exc
+    except FileNotFoundError as exc:
         msg = "macOS `security` command not found. Is this a macOS system?"
-        raise RuntimeError(msg)
+        raise RuntimeError(msg) from exc

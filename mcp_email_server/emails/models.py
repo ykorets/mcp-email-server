@@ -1,7 +1,9 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from mcp_email_server.emails.attachments import AttachmentInfo
 
 
 class EmailMetadata(BaseModel):
@@ -14,6 +16,8 @@ class EmailMetadata(BaseModel):
     recipients: list[str]  # Recipient list
     date: datetime
     attachments: list[str]
+    attachment_info: list[AttachmentInfo] = Field(default_factory=list)
+    attachment_info_available: bool = False
 
     @classmethod
     def from_email(cls, email: dict[str, Any]):
@@ -25,6 +29,8 @@ class EmailMetadata(BaseModel):
             recipients=email.get("to", []),
             date=email["date"],
             attachments=email["attachments"],
+            attachment_info=email.get("attachment_info", []),
+            attachment_info_available=email.get("attachment_info_available", False),
         )
 
 

@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import email.utils
 import mimetypes
 import re
@@ -20,6 +22,16 @@ import aiosmtplib
 
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails import EmailHandler
+from mcp_email_server.emails.attachments import (
+    MAX_ATTACHMENTS,
+    MAX_FILE_BYTES,
+    MAX_MESSAGE_BYTES,
+    AttachmentInfo,
+    BinaryAttachment,
+    mime_part,
+    raw_attachment_info,
+    structures_by_uid,
+)
 from mcp_email_server.emails.drafts import append_to_drafts, compose_draft_message
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
@@ -32,6 +44,7 @@ from mcp_email_server.log import logger
 
 # Maximum body length before truncation (characters)
 MAX_BODY_LENGTH = 20000
+_attachment_reads = asyncio.Semaphore(1)
 
 
 def _quote_mailbox(mailbox: str) -> str:
@@ -48,8 +61,8 @@ def _quote_mailbox(mailbox: str) -> str:
     """
     # Per RFC 3501, literal double-quote characters in a quoted string must
     # be escaped with a backslash. Backslashes themselves must also be escaped.
-    escaped = mailbox.replace("\\", "\\\\").replace('"', r'\"')
-    return f'"{ escaped}"'
+    escaped = mailbox.replace("\\", "\\\\").replace('"', r"\"")
+    return f'"{escaped}"'
 
 
 async def _send_imap_id(imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL) -> None:
@@ -172,7 +185,7 @@ class EmailClient:
             # Remove script and style elements
             text = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
             # Convert common block elements to newlines
-            text = re.sub(r"<(br|p|div|tr|li)[^>]*/?>" , "\n", text, flags=re.IGNORECASE)
+            text = re.sub(r"<(br|p|div|tr|li)[^>]*/?>", "\n", text, flags=re.IGNORECASE)
             # Remove all remaining HTML tags
             text = re.sub(r"<[^>]+>", "", text)
             # Decode common HTML entities
@@ -190,7 +203,7 @@ class EmailClient:
                 content_disposition = str(part.get("Content-Disposition", ""))
 
                 # Handle attachments
-                if "attachment" in content_disposition:
+                if "attachment" in content_disposition or part.get_filename():
                     filename = part.get_filename()
                     if filename:
                         attachments.append(filename)
@@ -231,6 +244,7 @@ class EmailClient:
         # TODO: Allow retrieving full email body
         if body and len(body) > MAX_BODY_LENGTH:
             body = body[:MAX_BODY_LENGTH] + "...[TRUNCATED]"
+        attachment_details = raw_attachment_info(email_message)
         return {
             "email_id": email_id or "",
             "message_id": message_id,
@@ -239,7 +253,9 @@ class EmailClient:
             "to": to_addresses,
             "body": body,
             "date": date,
-            "attachments": attachments,
+            "attachments": [a.name for a in attachment_details],
+            "attachment_info": attachment_details,
+            "attachment_info_available": True,
         }
 
     @staticmethod
@@ -415,6 +431,82 @@ class EmailClient:
 
         return results
 
+    async def _attachment_metadata(self, imap, email_ids) -> dict[str, list[AttachmentInfo]]:
+        if not email_ids:
+            return {}
+        ids = [u.decode() if isinstance(u, bytes) else str(u) for u in email_ids]
+        if not all(re.fullmatch(r"[1-9][0-9]*", u) for u in ids):
+            raise ValueError("Invalid IMAP UID")
+        status, data = await imap.uid("fetch", ",".join(ids), "(BODYSTRUCTURE)")
+        if str(status).upper() != "OK":
+            raise ValueError("Could not retrieve attachment metadata")
+        return structures_by_uid(data)
+
+    async def get_attachment(self, email_id: str, attachment_id: str, mailbox="INBOX") -> BinaryAttachment:
+        async with _attachment_reads:
+            return await self._get_attachment(email_id, attachment_id, mailbox)
+
+    async def _get_attachment(self, email_id: str, attachment_id: str, mailbox="INBOX") -> BinaryAttachment:  # noqa: C901 - fail-closed IMAP transfer checks
+        if not mailbox or len(mailbox) > 1024 or any(c in mailbox for c in "\r\n\x00"):
+            raise ValueError("Invalid mailbox name")
+        if not re.fullmatch(r"[1-9][0-9]*", email_id) or not re.fullmatch(
+            r"[1-9][0-9]*(\.[1-9][0-9]*)*", attachment_id
+        ):
+            raise ValueError("Invalid IMAP UID or attachment section")
+        imap = self._imap_connect()
+        try:
+            await imap._client_task
+            await imap.wait_hello_from_server()
+            status, _ = await imap.login(self.email_server.user_name, self.email_server.password.get_secret_value())
+            if str(status).upper() != "OK":
+                raise ValueError("Mailbox login failed")
+            await _send_imap_id(imap)
+            status, _ = await imap.select(_quote_mailbox(mailbox))
+            if str(status).upper() != "OK":
+                raise ValueError("Mailbox unavailable")
+            infos = (await self._attachment_metadata(imap, [email_id])).get(email_id)
+            if infos is None:
+                raise ValueError("Attachment metadata unavailable")
+            info = next((i for i in infos if i.attachment_id == attachment_id), None)
+            if info is None:
+                raise ValueError("Attachment section not found")
+            if info.size > MAX_MESSAGE_BYTES:
+                raise ValueError("Encoded attachment exceeds transfer limit")
+            # This aioimaplib version does not enter SELECTED state after EXAMINE.
+            # Use a fresh SELECT + PEEK session; never STORE or RFC822/BODY[] fallback.
+            status, response = await imap.uid("fetch", email_id, f"(BODY.PEEK[{attachment_id}])")
+            if str(status).upper() != "OK":
+                raise ValueError("Could not fetch attachment")
+            payload = next((bytes(x) for x in response if isinstance(x, bytearray)), None)
+            if payload is None or len(payload) > MAX_MESSAGE_BYTES:
+                raise ValueError("Attachment missing or exceeds transfer limit")
+            if len(payload) != info.size:
+                raise ValueError("Attachment size differs from mailbox metadata; no partial file returned")
+            # Retrieve this part's headers for its original transfer encoding.
+            status, response = await imap.uid("fetch", email_id, f"(BODY.PEEK[{attachment_id}.MIME])")
+            headers = next((bytes(x) for x in response if isinstance(x, bytearray)), None)
+            if str(status).upper() != "OK" or headers is None or len(headers) > 65536:
+                raise ValueError("Attachment MIME headers unavailable")
+            part = BytesParser(policy=default).parsebytes(headers.rstrip(b"\r\n") + b"\r\n\r\n" + payload)
+            if part.get_content_type() != info.mime_type:
+                raise ValueError("Attachment MIME type differs from mailbox metadata")
+            if str(part.get("Content-Transfer-Encoding", "")).lower() == "base64":
+                try:
+                    base64.b64decode(b"".join(payload.split()), validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise ValueError("Invalid base64 attachment") from exc
+            decoded = part.get_payload(decode=True)
+            if decoded is None and info.mime_type == "message/rfc822":
+                decoded = payload
+            if decoded is None or len(decoded) > MAX_FILE_BYTES:
+                raise ValueError("Decoded attachment exceeds 16 MiB or cannot be decoded")
+            return BinaryAttachment(info.name, info.mime_type, decoded)
+        finally:
+            try:
+                await imap.logout()
+            except Exception:
+                logger.info("Attachment IMAP connection closed")
+
     async def get_email_count(
         self,
         before: datetime | None = None,
@@ -526,6 +618,14 @@ class EmailClient:
             # Phase 2: Batch fetch headers for requested page only
             fetch_headers_start = time.perf_counter()
             metadata_by_uid = await self._batch_fetch_headers(imap, page_uids)
+            try:
+                infos = await self._attachment_metadata(imap, page_uids)
+            except (ValueError, TypeError, IndexError):
+                infos = {}
+            for uid, item in metadata_by_uid.items():
+                item["attachment_info_available"] = uid in infos
+                item["attachment_info"] = infos.get(uid, [])
+                item["attachments"] = [a.name for a in infos.get(uid, [])]
             fetch_headers_elapsed = time.perf_counter() - fetch_headers_start
 
             logger.info(
@@ -719,6 +819,8 @@ class EmailClient:
             logger.error(msg)
             raise ValueError(msg)
 
+        if path.stat().st_size > MAX_FILE_BYTES:
+            raise ValueError("Attachment exceeds 16 MiB")
         return path
 
     def _create_attachment_part(self, path: Path) -> MIMEApplication:
@@ -757,7 +859,7 @@ class EmailClient:
 
         return msg
 
-    async def send_email(
+    async def send_email(  # noqa: C901 - MIME headers and provider envelope
         self,
         recipients: list[str],
         subject: str,
@@ -768,10 +870,15 @@ class EmailClient:
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
+        binary_attachments: list[BinaryAttachment] | None = None,
     ):
+        if len(attachments or []) + len(binary_attachments or []) > MAX_ATTACHMENTS:
+            raise ValueError("At most 20 attachments per message")
         # Create message with or without attachments
-        if attachments:
-            msg = self._create_message_with_attachments(body, html, attachments)
+        if attachments or binary_attachments:
+            msg = self._create_message_with_attachments(body, html, attachments or [])
+            for item in binary_attachments or []:
+                msg.attach(mime_part(item))
         else:
             content_type = "html" if html else "plain"
             msg = MIMEText(body, content_type, "utf-8")
@@ -805,6 +912,8 @@ class EmailClient:
         msg["Date"] = email.utils.formatdate(localtime=True)
         sender_domain = self.sender.rsplit("@", 1)[-1].rstrip(">")
         msg["Message-Id"] = email.utils.make_msgid(domain=sender_domain)
+        if len(msg.as_bytes()) > MAX_MESSAGE_BYTES:
+            raise ValueError("Encoded message exceeds 25 MB")
 
         # Note: BCC recipients are not added to headers (they remain hidden)
         # but will be included in the actual recipients for SMTP delivery
@@ -1090,6 +1199,8 @@ class ClassicEmailHandler(EmailHandler):
                             date=email_data["date"],
                             body=email_data["body"],
                             attachments=email_data["attachments"],
+                            attachment_info=email_data.get("attachment_info", []),
+                            attachment_info_available=email_data.get("attachment_info_available", False),
                         )
                     )
                 else:
@@ -1116,9 +1227,11 @@ class ClassicEmailHandler(EmailHandler):
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
+        binary_attachments: list[BinaryAttachment] | None = None,
     ) -> None:
+        extra = {"binary_attachments": binary_attachments} if binary_attachments else {}
         msg = await self.outgoing_client.send_email(
-            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references
+            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, **extra
         )
 
         # Save to Sent folder if enabled
@@ -1142,6 +1255,7 @@ class ClassicEmailHandler(EmailHandler):
         html: bool = False,
         in_reply_to: str | None = None,
         references: str | None = None,
+        binary_attachments: list[BinaryAttachment] | None = None,
     ) -> str:
         """Create a draft email and save it to the Drafts folder via IMAP APPEND.
 
@@ -1175,6 +1289,7 @@ class ClassicEmailHandler(EmailHandler):
             html=html,
             in_reply_to=in_reply_to,
             references=references,
+            **({"binary_attachments": binary_attachments} if binary_attachments else {}),
         )
 
         # Save to Drafts folder via IMAP APPEND

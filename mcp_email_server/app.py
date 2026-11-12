@@ -1,7 +1,11 @@
+import json
+import re
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
+from urllib.parse import quote
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import BlobResourceContents, CallToolResult, EmbeddedResource, TextContent
 from pydantic import Field
 
 from mcp_email_server.config import (
@@ -9,6 +13,15 @@ from mcp_email_server.config import (
     EmailSettings,
     ProviderSettings,
     get_settings,
+)
+from mcp_email_server.emails.attachments import (
+    CHUNK_BYTES,
+    MAX_ATTACHMENTS,
+    MAX_FILE_BYTES,
+    MAX_MESSAGE_BYTES,
+    TRANSFER_TTL_SECONDS,
+    MailAttachmentSource,
+    TransferStore,
 )
 from mcp_email_server.emails.dispatcher import dispatch_handler
 from mcp_email_server.emails.models import (
@@ -18,6 +31,111 @@ from mcp_email_server.emails.models import (
 )
 
 mcp = FastMCP("email")
+
+attachment_transfers = TransferStore()
+
+
+def _attachment_caller(ctx: Context | None) -> str:
+    if ctx is None:
+        raise ValueError("Attachment transfers require an MCP request context")
+    request = ctx.request_context.request
+    if request is None:
+        return f"stdio:{id(ctx.request_context.session)}"
+    # The private container is reached only through the existing OAuth proxy.
+    # It overwrites this header AFTER bearer validation, and never forwards the token.
+    caller = request.headers.get("x-email-mcp-caller", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", caller):
+        raise ValueError("Trusted attachment caller missing; use the authenticated MCP endpoint")
+    return caller
+
+
+async def _attachment_inputs(ctx, upload_ids, sources):
+    if len(upload_ids or []) + len(sources or []) > MAX_ATTACHMENTS:
+        raise ValueError("At most 20 attachments per message")
+    # Remove temporary uploads BEFORE trying IMAP/SMTP. Never reuse them after
+    # an uncertain send/APPEND outcome. There is no automatic provider retry.
+    items = attachment_transfers.consume(_attachment_caller(ctx), upload_ids) if upload_ids else []
+    if sum(len(i.data) for i in items) > MAX_FILE_BYTES:
+        raise ValueError("Combined raw attachments exceed 16 MiB")
+    for source in sources or []:
+        handler = dispatch_handler(source.account_name)
+        if not hasattr(handler, "incoming_client"):
+            raise ValueError("Remote attachments require an IMAP account")
+        items.append(
+            await handler.incoming_client.get_attachment(source.email_id, source.attachment_id, source.mailbox)
+        )
+        if sum(len(i.data) for i in items) > MAX_FILE_BYTES:
+            raise ValueError("Combined raw attachments exceed 16 MiB")
+    return items
+
+
+@mcp.tool(description="Get attachment transfer limits. Files stay only in bounded process memory, never on disk.")
+def attachment_limits() -> dict[str, Any]:
+    return {
+        "max_file_bytes": MAX_FILE_BYTES,
+        "max_total_raw_attachment_bytes": MAX_FILE_BYTES,
+        "max_encoded_message_bytes": MAX_MESSAGE_BYTES,
+        "chunk_bytes": CHUNK_BYTES,
+        "max_attachments": MAX_ATTACHMENTS,
+        "expires_after_seconds": TRANSFER_TTL_SECONDS,
+    }
+
+
+@mcp.tool(
+    description="Start uploading a file through MCP. Supply the exact byte size and SHA-256. Append base64 chunks, then use upload_id in create_draft/send_email. No server path is needed. Transfers expire in ten minutes and are private to this connection credential."
+)
+def begin_attachment_upload(
+    name: str, mime_type: str, size: Annotated[int, Field(ge=0, le=MAX_FILE_BYTES)], sha256: str, ctx: Context = None
+) -> dict[str, Any]:
+    handle = attachment_transfers.begin(_attachment_caller(ctx), name, mime_type, size, sha256)
+    return {"upload_id": handle, "chunk_bytes": CHUNK_BYTES, "expires_after_seconds": TRANSFER_TTL_SECONDS}
+
+
+@mcp.tool(
+    description="Append at most 256 KiB of strict base64 at the next byte offset. Duplicate identical chunks may be retried safely. Ready is true only after size and SHA-256 verification."
+)
+def upload_attachment_chunk(
+    upload_id: str, offset: Annotated[int, Field(ge=0)], content_base64: str, ctx: Context = None
+) -> dict[str, Any]:
+    return attachment_transfers.append(_attachment_caller(ctx), upload_id, offset, content_base64)
+
+
+@mcp.tool(description="Immediately discard your unused upload or unfinished download from temporary memory.")
+def discard_attachment_transfer(transfer_id: str, ctx: Context = None) -> dict[str, Any]:
+    attachment_transfers.discard(transfer_id, _attachment_caller(ctx))
+    return {"discarded": True}
+
+
+@mcp.tool(
+    description="Get one attachment through MCP by its attachment_id (MIME section) from attachment_info. Preserves unread flags. Returns base64 bytes, exact decoded size and SHA-256. For larger files follow download_id/next_offset with read_attachment_chunk. No filesystem download or public link."
+)
+async def get_attachment(
+    account_name: str, email_id: str, attachment_id: str, mailbox: str = "INBOX", ctx: Context = None
+) -> CallToolResult:
+    caller = _attachment_caller(ctx)
+    handler = dispatch_handler(account_name)
+    if not hasattr(handler, "incoming_client"):
+        raise ValueError("Remote attachments require an IMAP account")
+    item = await handler.incoming_client.get_attachment(email_id, attachment_id, mailbox)
+    result = attachment_transfers.download(caller, item)
+    summary = {k: v for k, v in result.items() if k != "content_base64"} if result["complete"] else result
+    content = [TextContent(type="text", text=json.dumps(summary))]
+    if result["complete"]:
+        uri = f"attachment://mail/{quote(account_name, safe='')}/{email_id}/{attachment_id}/{quote(item.name, safe='')}"
+        content.append(
+            EmbeddedResource(
+                type="resource",
+                resource=BlobResourceContents(uri=uri, mimeType=item.mime_type, blob=result["content_base64"]),
+            )
+        )
+    return CallToolResult(content=content, structuredContent=result)
+
+
+@mcp.tool(
+    description="Read the next base64 chunk of your attachment download. The last chunk deletes the temporary copy; abandoned downloads expire automatically. After a lost final response, get the original attachment again (safe read)."
+)
+def read_attachment_chunk(download_id: str, offset: Annotated[int, Field(ge=0)], ctx: Context = None) -> dict[str, Any]:
+    return attachment_transfers.read(_attachment_caller(ctx), download_id, offset)
 
 
 @mcp.resource("email://{account_name}")
@@ -118,7 +236,7 @@ async def get_emails_content(
 
 
 @mcp.tool(
-    description="Send an email using the specified account. Supports replying to emails with proper threading when in_reply_to is provided.",
+    description="Send only after explicit owner approval. Attach remote files using attachment_upload_ids, or explicitly copy original mailbox parts using attachment_sources. Temporary uploads are consumed even if the provider operation fails; inspect Sent before retrying an uncertain send. Existing local attachments paths remain supported.",
 )
 async def send_email(
     account_name: Annotated[str, Field(description="The name of the email account to send from.")],
@@ -158,7 +276,15 @@ async def send_email(
             description="Space-separated Message-IDs for the thread chain. Usually includes in_reply_to plus ancestors.",
         ),
     ] = None,
+    attachment_upload_ids: list[str] | None = None,
+    attachment_sources: list[MailAttachmentSource] | None = None,
+    ctx: Context = None,
 ) -> str:
+    binary = (
+        await _attachment_inputs(ctx, attachment_upload_ids, attachment_sources)
+        if attachment_upload_ids or attachment_sources
+        else []
+    )
     handler = dispatch_handler(account_name)
     await handler.send_email(
         recipients,
@@ -170,14 +296,15 @@ async def send_email(
         attachments,
         in_reply_to,
         references,
+        **({"binary_attachments": binary} if binary else {}),
     )
     recipient_str = ", ".join(recipients)
-    attachment_info = f" with {len(attachments)} attachment(s)" if attachments else ""
+    attachment_info = f" with {(len(attachments or []) + len(binary))} attachment(s)" if attachments or binary else ""
     return f"Email sent successfully to {recipient_str}{attachment_info}"
 
 
 @mcp.tool(
-    description="Create a draft email and save it to the Drafts folder without sending. The draft will appear in the email client's Drafts folder, ready for the user to review and send manually. No SMTP required \u2014 this is a pure IMAP operation.",
+    description="Create a draft email and save it to the Drafts folder without sending. The draft will appear in the email client's Drafts folder, ready for the user to review and send manually. Use attachment_upload_ids or attachment_sources to save attachments inside the IMAP draft. No SMTP required \u2014 this is a pure IMAP operation.",
 )
 async def create_draft(
     account_name: Annotated[str, Field(description="The name of the email account to create the draft in.")],
@@ -210,7 +337,15 @@ async def create_draft(
             description="Space-separated Message-IDs for the thread chain. Usually includes in_reply_to plus ancestors.",
         ),
     ] = None,
+    attachment_upload_ids: list[str] | None = None,
+    attachment_sources: list[MailAttachmentSource] | None = None,
+    ctx: Context = None,
 ) -> str:
+    binary = (
+        await _attachment_inputs(ctx, attachment_upload_ids, attachment_sources)
+        if attachment_upload_ids or attachment_sources
+        else []
+    )
     handler = dispatch_handler(account_name)
     result = await handler.create_draft(
         recipients,
@@ -221,6 +356,7 @@ async def create_draft(
         html,
         in_reply_to,
         references,
+        **({"binary_attachments": binary} if binary else {}),
     )
     return result
 

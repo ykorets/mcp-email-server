@@ -33,16 +33,16 @@ def _resolve_keychain_password(account: str) -> str:
     Raises RuntimeError if the lookup fails.
     """
     if sys.platform != "darwin":
-        raise RuntimeError(
-            f"Keychain password references ('{KEYCHAIN_PREFIX}') are only supported on macOS"
-        )
+        raise RuntimeError(f"Keychain password references ('{KEYCHAIN_PREFIX}') are only supported on macOS")
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: S603 - fixed system executable and argv, never a shell
             [
-                "security",
+                "/usr/bin/security",
                 "find-generic-password",
-                "-s", KEYCHAIN_SERVICE,
-                "-a", account,
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                account,
                 "-w",
             ],
             capture_output=True,
@@ -52,14 +52,13 @@ def _resolve_keychain_password(account: str) -> str:
         if result.returncode != 0:
             stderr = result.stderr.strip()
             raise RuntimeError(
-                f"Keychain lookup failed for account '{account}' "
-                f"(service='{KEYCHAIN_SERVICE}'): {stderr}"
+                f"Keychain lookup failed for account '{account}' (service='{KEYCHAIN_SERVICE}'): {stderr}"
             )
         return result.stdout.strip()
-    except FileNotFoundError:
-        raise RuntimeError("'security' command not found \u2014 are you on macOS?")
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"Keychain lookup timed out for account '{account}'")
+    except FileNotFoundError as exc:
+        raise RuntimeError("'security' command not found \u2014 are you on macOS?") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Keychain lookup timed out for account '{account}'") from exc
 
 
 def _parse_bool_env(value: str | None, default: bool = False) -> bool:
@@ -94,7 +93,7 @@ class EmailServer(BaseModel):
         """
         raw = obj.password.get_secret_value()
         if raw.startswith(KEYCHAIN_PREFIX):
-            account = raw[len(KEYCHAIN_PREFIX):]
+            account = raw[len(KEYCHAIN_PREFIX) :]
             obj._keychain_ref = raw  # preserve original reference
             real_password = _resolve_keychain_password(account)
             obj.password = SecretStr(real_password)

@@ -23,9 +23,9 @@ from mcp_email_server.emails.classic import ClassicEmailHandler
 
 async def test_read(handler, account_name: str):
     """Test 1: Read recent emails (verify IMAP connection works)."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"TEST 1: Reading recent emails from {account_name}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     try:
         result = await handler.get_emails_metadata(page=1, page_size=3)
         print(f"  Total emails in INBOX: {result.total}")
@@ -40,9 +40,9 @@ async def test_read(handler, account_name: str):
 
 async def test_draft(handler, account_name: str):
     """Test 2: Create a draft email."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"TEST 2: Creating draft in {account_name}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     try:
         result = await handler.create_draft(
             recipients=["test@example.com"],
@@ -91,9 +91,9 @@ async def main():
     draft_ok = await test_draft(handler, account_name)
 
     # Summary
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("SUMMARY")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"  IMAP Read:     {'✅' if read_ok else '❌'}")
     print(f"  Create Draft:  {'✅' if draft_ok else '❌'}")
 
@@ -101,7 +101,7 @@ async def main():
         print(f"\n🎉 All tests passed for {account_name}!")
         print(f"   Check Drafts folder in {account.email_address}")
     else:
-        print(f"\n⚠️  Some tests failed. Check errors above.")
+        print("\n⚠️  Some tests failed. Check errors above.")
 
 
 if __name__ == "__main__":

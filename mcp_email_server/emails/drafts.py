@@ -9,21 +9,21 @@ The implementation follows the same pattern as append_to_sent in classic.py.
 
 import email.utils
 import ssl
-
-import aioimaplib
-
 from email.header import Header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import aioimaplib
+
 from mcp_email_server.config import EmailServer
+from mcp_email_server.emails.attachments import MAX_ATTACHMENTS, MAX_MESSAGE_BYTES, BinaryAttachment, mime_part
 from mcp_email_server.log import logger
 
 
 def _quote_mailbox(mailbox: str) -> str:
     """Quote mailbox name for IMAP compatibility."""
-    escaped = mailbox.replace("\\\\", "\\\\\\\\").replace('"', r'\"')
-    return f'"{ escaped}"'
+    escaped = mailbox.replace("\\\\", "\\\\\\\\").replace('"', r"\"")
+    return f'"{escaped}"'
 
 
 def _create_ssl_context(verify_ssl: bool) -> ssl.SSLContext | None:
@@ -36,6 +36,10 @@ def _create_ssl_context(verify_ssl: bool) -> ssl.SSLContext | None:
     return ctx
 
 
+def _encoded_header(value: str):
+    return Header(value, "utf-8") if any(ord(c) > 127 for c in value) else value
+
+
 def compose_draft_message(
     sender: str,
     recipients: list[str],
@@ -46,6 +50,7 @@ def compose_draft_message(
     html: bool = False,
     in_reply_to: str | None = None,
     references: str | None = None,
+    binary_attachments: list[BinaryAttachment] | None = None,
 ) -> MIMEText | MIMEMultipart:
     """Compose a MIME message suitable for saving as a draft.
 
@@ -63,25 +68,27 @@ def compose_draft_message(
     Returns:
         A MIMEText or MIMEMultipart message object.
     """
+    if len(binary_attachments or []) > MAX_ATTACHMENTS:
+        raise ValueError("At most 20 attachments per message")
     content_type = "html" if html else "plain"
-    msg = MIMEText(body, content_type, "utf-8")
-
-    # Handle subject with special characters
-    if any(ord(c) > 127 for c in subject):
-        msg["Subject"] = Header(subject, "utf-8")
+    text = MIMEText(body, content_type, "utf-8")
+    if binary_attachments:
+        msg = MIMEMultipart()
+        msg.attach(text)
+        for item in binary_attachments:
+            msg.attach(mime_part(item))
     else:
-        msg["Subject"] = subject
+        msg = text
 
-    # Handle sender name with special characters
-    if any(ord(c) > 127 for c in sender):
-        msg["From"] = Header(sender, "utf-8")
-    else:
-        msg["From"] = sender
+    msg["Subject"] = _encoded_header(subject)
+    msg["From"] = _encoded_header(sender)
 
     msg["To"] = ", ".join(recipients)
 
     if cc:
         msg["Cc"] = ", ".join(cc)
+    if bcc:
+        msg["Bcc"] = ", ".join(bcc)
 
     # Set threading headers for replies
     if in_reply_to:
@@ -94,6 +101,8 @@ def compose_draft_message(
     sender_domain = sender.rsplit("@", 1)[-1].rstrip(">")
     msg["Message-Id"] = email.utils.make_msgid(domain=sender_domain)
 
+    if len(msg.as_bytes()) > MAX_MESSAGE_BYTES:
+        raise ValueError("Encoded message exceeds 25 MB")
     return msg
 
 
@@ -172,6 +181,7 @@ async def append_to_drafts(
 
         # Try to find and use the Drafts folder
         for folder in drafts_folder_candidates:
+            append_started = False
             try:
                 logger.debug(f"Trying Drafts folder: '{folder}'")
                 result = await imap.select(_quote_mailbox(folder))
@@ -180,6 +190,7 @@ async def append_to_drafts(
                 if str(status).upper() == "OK":
                     msg_bytes = msg.as_bytes()
                     logger.debug(f"Appending draft to '{folder}'")
+                    append_started = True
                     append_result = await imap.append(
                         msg_bytes,
                         mailbox=_quote_mailbox(folder),
@@ -194,6 +205,8 @@ async def append_to_drafts(
                 else:
                     logger.debug(f"Folder '{folder}' select returned: {status}")
             except Exception as e:
+                if append_started:
+                    raise RuntimeError("Draft save outcome is unknown; inspect Drafts before retrying") from e
                 logger.debug(f"Folder '{folder}' not available: {e}")
                 continue
 

@@ -62,41 +62,21 @@ class TestEmailClient:
         assert result["attachments"] == []
 
     def test_parse_email_data_with_attachments(self):
-        """Test parsing email with attachments."""
-        # This would require creating a multipart email with attachments
-        # For simplicity, we'll mock the email parsing
-        with patch("email.parser.BytesParser.parsebytes") as mock_parse:
-            mock_email = MagicMock()
-            mock_email.get.side_effect = lambda x, default=None: {
-                "Subject": "Test Subject",
-                "From": "sender@example.com",
-                "Date": email.utils.formatdate(),
-            }.get(x, default)
-            mock_email.is_multipart.return_value = True
+        from email.message import EmailMessage
 
-            # Mock parts
-            text_part = MagicMock()
-            text_part.get_content_type.return_value = "text/plain"
-            text_part.get.return_value = ""  # Not an attachment
-            text_part.get_payload.return_value = b"This is the email body"
-            text_part.get_content_charset.return_value = "utf-8"
-
-            attachment_part = MagicMock()
-            attachment_part.get_content_type.return_value = "application/pdf"
-            attachment_part.get.return_value = "attachment; filename=test.pdf"
-            attachment_part.get_filename.return_value = "test.pdf"
-
-            mock_email.walk.return_value = [text_part, attachment_part]
-            mock_parse.return_value = mock_email
-
-            client = EmailClient(MagicMock())
-            result = client._parse_email_data(b"dummy email content")
-
-            assert result["subject"] == "Test Subject"
-            assert result["from"] == "sender@example.com"
-            assert result["body"] == "This is the email body"
-            assert isinstance(result["date"], datetime)
-            assert result["attachments"] == ["test.pdf"]
+        message = EmailMessage()
+        message["Subject"] = "Test Subject"
+        message["From"] = "sender@example.com"
+        message["To"] = "recipient@example.com"
+        message["Date"] = email.utils.formatdate()
+        message.set_content("This is the email body")
+        message.add_attachment(b"PDF bytes", maintype="application", subtype="pdf", filename="test.pdf")
+        result = EmailClient(MagicMock())._parse_email_data(message.as_bytes())
+        assert result["subject"] == "Test Subject"
+        assert result["body"].strip() == "This is the email body"
+        assert result["attachments"] == ["test.pdf"]
+        assert result["attachment_info"][0].size == 9
+        assert result["attachment_info"][0].attachment_id == "2"
 
     def test_build_search_criteria(self):
         """Test building search criteria for IMAP."""
