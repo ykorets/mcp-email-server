@@ -124,3 +124,17 @@ fingerprint change. A source commit and local tests do not establish that the
 hosted MCP has been updated, or that a particular client UI can upload its local
 files automatically. A hosted client draft/attachment acceptance remains part
 of deployment verification.
+
+## Sent and safe removal
+
+`move_to_trash` replaces the destructive MCP deletion tool. It resolves the
+mailbox's special-use Trash folder and uses atomic UID MOVE only. Unsupported
+servers fail without a STORE/EXPUNGE fallback; removing something already in
+Trash never empties it. Lost acknowledgements are not replayed automatically.
+
+Gmail SMTP manages its Sent copy; the handler never adds another IMAP copy.
+Spacemail installations enable `save_to_sent`. Folder discovery prefers the
+server's special-use Sent flag, including localized or unquoted LIST names.
+Before APPEND, Message-ID lookup detects an existing copy. Only one APPEND is
+attempted: an uncertain result is reported after SMTP success with instructions
+to reconcile Sent rather than resend the message.

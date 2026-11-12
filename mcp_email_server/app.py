@@ -297,7 +297,7 @@ async def send_email(
         else []
     )
     handler = dispatch_handler(account_name)
-    await handler.send_email(
+    delivery = await handler.send_email(
         recipients,
         subject,
         body,
@@ -311,7 +311,10 @@ async def send_email(
     )
     recipient_str = ", ".join(recipients)
     attachment_info = f" with {(len(attachments or []) + len(binary))} attachment(s)" if attachments or binary else ""
-    return f"Email sent successfully to {recipient_str}{attachment_info}"
+    result = f"Email sent successfully to {recipient_str}{attachment_info}"
+    if isinstance(delivery, dict) and delivery.get("sent_copy") == "unconfirmed":
+        result += f". SMTP delivered; Sent copy unconfirmed (Message-ID: {delivery.get('message_id')}). Do not resend; reconcile Sent."
+    return result
 
 
 @mcp.tool(
@@ -373,23 +376,31 @@ async def create_draft(
 
 
 @mcp.tool(
-    description="Delete one or more emails by their email_id. Use list_emails_metadata first to get the email_id."
+    description="Move messages to the mailbox Trash folder. Never permanently deletes or empties Trash. Unsupported atomic moves fail without deletion."
 )
-async def delete_emails(
+async def move_to_trash(
     account_name: Annotated[str, Field(description="The name of the email account.")],
     email_ids: Annotated[
         list[str],
-        Field(description="List of email_id to delete (obtained from list_emails_metadata)."),
+        Field(description="Individual IMAP UIDs to move to Trash."),
     ],
-    mailbox: Annotated[str, Field(default="INBOX", description="The mailbox to delete emails from.")] = "INBOX",
+    mailbox: Annotated[str, Field(default="INBOX", description="Source mailbox to move messages from.")] = "INBOX",
 ) -> str:
     handler = dispatch_handler(account_name)
-    deleted_ids, failed_ids = await handler.delete_emails(email_ids, mailbox)
+    if not hasattr(handler, "move_to_trash"):
+        raise ValueError("Safe Trash moves are unavailable for this provider")
+    deleted_ids, failed_ids = await handler.move_to_trash(email_ids, mailbox)
 
-    result = f"Successfully deleted {len(deleted_ids)} email(s)"
+    result = f"Successfully moved {len(deleted_ids)} email(s) to Trash"
     if failed_ids:
-        result += f", failed to delete {len(failed_ids)} email(s): {', '.join(failed_ids)}"
+        result += (
+            f", not confirmed moved; reconcile before retrying {len(failed_ids)} email(s): {', '.join(failed_ids)}"
+        )
     return result
+
+
+# Python compatibility only; the MCP catalog exposes move_to_trash, never delete.
+delete_emails = move_to_trash
 
 
 @mcp.tool(

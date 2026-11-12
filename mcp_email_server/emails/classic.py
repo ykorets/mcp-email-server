@@ -9,6 +9,7 @@ import time
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from email.header import Header
+from email.message import Message
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -33,6 +34,7 @@ from mcp_email_server.emails.attachments import (
     structures_by_uid,
 )
 from mcp_email_server.emails.drafts import append_to_drafts, compose_draft_message
+from mcp_email_server.emails.folders import special_folder, validate_mailbox
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
@@ -978,28 +980,11 @@ class EmailClient:
             The folder name with the \\Sent flag, or None if not found
         """
         try:
-            # List all folders - aioimaplib requires reference_name and mailbox_pattern
-            _, folders = await imap.list('""', "*")
+            return await special_folder(imap, r"\Sent")
+        except Exception:
+            return None
 
-            # Search for folder with \Sent flag
-            for folder in folders:
-                folder_str = folder.decode("utf-8") if isinstance(folder, bytes) else str(folder)
-                # IMAP LIST response format: (flags) "delimiter" "name"
-                # Example: (\Sent \HasNoChildren) "/" "Gesendete Objekte"
-                if r"\Sent" in folder_str or "\\Sent" in folder_str:
-                    # Extract folder name from the response
-                    # Split by quotes and get the last quoted part
-                    parts = folder_str.split('"')
-                    if len(parts) >= 3:
-                        folder_name = parts[-2]  # The folder name is the second-to-last quoted part
-                        logger.info(f"Found Sent folder by \\Sent flag: '{folder_name}'")
-                        return folder_name
-        except Exception as e:
-            logger.debug(f"Error finding Sent folder by flag: {e}")
-
-        return None
-
-    async def append_to_sent(
+    async def append_to_sent(  # noqa: C901 - folder discovery before exactly one APPEND
         self,
         msg: MIMEText | MIMEMultipart,
         incoming_server: EmailServer,
@@ -1042,9 +1027,9 @@ class EmailClient:
 
             # Try to find Sent folder by IMAP \Sent flag first
             flag_folder = await self._find_sent_folder_by_flag(imap)
-            if flag_folder and flag_folder not in sent_folder_candidates:
-                # Add it at the beginning (high priority)
-                sent_folder_candidates.insert(0, flag_folder)
+            if flag_folder:
+                sent_folder_candidates = list(dict.fromkeys([flag_folder, sent_folder_name, *sent_folder_candidates]))
+                sent_folder_candidates = [folder for folder in sent_folder_candidates if folder]
 
             # Try to find and use the Sent folder
             for folder in sent_folder_candidates:
@@ -1061,18 +1046,30 @@ class EmailClient:
                         msg_bytes = msg.as_bytes(policy=SMTP)
                         logger.debug(f"Appending message to '{folder}'")
                         # aioimaplib.append signature: (message_bytes, mailbox, flags, date)
-                        append_result = await imap.append(
-                            msg_bytes,
-                            mailbox=_quote_mailbox(folder),
-                            flags=r"(\Seen)",
-                        )
+                        message_id = str(msg.get("Message-Id", ""))
+                        if message_id:
+                            found_status, found = await imap.uid_search(
+                                "HEADER", "Message-ID", _quote_mailbox(message_id)
+                            )
+                            if str(found_status).upper() != "OK":
+                                return False
+                            if found and found[0].strip():
+                                return True
+                        try:
+                            append_result = await imap.append(
+                                msg_bytes, mailbox=_quote_mailbox(folder), flags=r"(\Seen)"
+                            )
+                        except Exception:
+                            logger.warning("Sent APPEND outcome unknown; reconcile by Message-ID, do not resend")
+                            return False
                         logger.debug(f"Append result: {append_result}")
                         append_status = append_result[0] if isinstance(append_result, tuple) else append_result
                         if str(append_status).upper() == "OK":
                             logger.info(f"Saved sent email to '{folder}'")
                             return True
                         else:
-                            logger.warning(f"Failed to append to '{folder}': {append_status}")
+                            logger.warning("Sent copy not confirmed; never retry SMTP or APPEND automatically")
+                            return False
                     else:
                         logger.debug(f"Folder '{folder}' select returned: {status}")
                 except Exception as e:
@@ -1091,35 +1088,48 @@ class EmailClient:
             except Exception as e:
                 logger.debug(f"Error during logout: {e}")
 
-    async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
-        """Delete emails by their UIDs. Returns (deleted_ids, failed_ids)."""
+    async def move_to_trash(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
+        """Atomic UID MOVE only. No STORE/EXPUNGE fallback or permanent removal."""
+        validate_mailbox(mailbox)
+        if len(email_ids) > 500 or not all(re.fullmatch(r"[1-9][0-9]*", uid) for uid in email_ids):
+            raise ValueError("Use at most 500 individual IMAP UIDs")
+        if not email_ids:
+            return [], []
         imap = self._imap_connect()
-        deleted_ids = []
-        failed_ids = []
-
+        moved, failed = [], []
         try:
             await imap._client_task
             await imap.wait_hello_from_server()
             await imap.login(self.email_server.user_name, self.email_server.password.get_secret_value())
             await _send_imap_id(imap)
-            await imap.select(_quote_mailbox(mailbox))
-
-            for email_id in email_ids:
+            target = await special_folder(imap, r"\Trash", ("Trash", "INBOX.Trash", "Deleted Items", "[Gmail]/Trash"))
+            if target is None:
+                raise ValueError("Trash folder unavailable; no mail moved")
+            if mailbox == target:
+                return list(dict.fromkeys(email_ids)), []
+            if "MOVE" not in {str(c).upper() for c in imap.protocol.capabilities}:
+                raise ValueError("Server does not support atomic MOVE; no mail changed")
+            status, _ = await imap.select(_quote_mailbox(mailbox))
+            if str(status).upper() != "OK":
+                raise ValueError("Source folder unavailable")
+            for uid in dict.fromkeys(email_ids):
                 try:
-                    await imap.uid("store", email_id, "+FLAGS", r"(\Deleted)")
-                    deleted_ids.append(email_id)
-                except Exception as e:
-                    logger.error(f"Failed to delete email {email_id}: {e}")
-                    failed_ids.append(email_id)
-
-            await imap.expunge()
+                    status, _ = await imap.uid("move", uid, _quote_mailbox(target))
+                    (moved if str(status).upper() == "OK" else failed).append(uid)
+                except Exception:
+                    # A lost acknowledgement is UNKNOWN, never automatically replayed.
+                    failed.extend(u for u in dict.fromkeys(email_ids) if u not in moved)
+                    break
+            return moved, failed
         finally:
             try:
                 await imap.logout()
-            except Exception as e:
-                logger.info(f"Error during logout: {e}")
+            except Exception:
+                logger.info("Trash IMAP connection closed")
 
-        return deleted_ids, failed_ids
+    async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
+        """Legacy Python alias: removal always means recoverable move to Trash."""
+        return await self.move_to_trash(email_ids, mailbox)
 
     async def mark_as_read(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
         """Mark emails as read (\\Seen) by their UIDs. Returns (marked_ids, failed_ids)."""
@@ -1154,7 +1164,10 @@ class ClassicEmailHandler(EmailHandler):
             email_settings.outgoing,
             sender=f"{email_settings.full_name} <{email_settings.email_address}>",
         )
-        self.save_to_sent = email_settings.save_to_sent
+        self.save_to_sent = email_settings.save_to_sent and email_settings.outgoing.host.lower() not in {
+            "smtp.gmail.com",
+            "smtp.googlemail.com",
+        }
         self.sent_folder_name = email_settings.sent_folder_name
 
     async def get_emails_metadata(
@@ -1257,22 +1270,29 @@ class ClassicEmailHandler(EmailHandler):
         in_reply_to: str | None = None,
         references: str | None = None,
         binary_attachments: list[BinaryAttachment] | None = None,
-    ) -> None:
+    ) -> dict:
         extra = {"binary_attachments": binary_attachments} if binary_attachments else {}
         msg = await self.outgoing_client.send_email(
             recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, **extra
         )
 
-        # Save to Sent folder if enabled
+        sent_copy = "provider_managed" if not self.save_to_sent else "unconfirmed"
         if self.save_to_sent and msg:
             try:
-                await self.outgoing_client.append_to_sent(
-                    msg,
-                    self.email_settings.incoming,
-                    self.sent_folder_name,
+                saved = await self.outgoing_client.append_to_sent(
+                    msg, self.email_settings.incoming, self.sent_folder_name
                 )
-            except Exception as e:
-                logger.error(f"Failed to save email to Sent folder: {e}", exc_info=True)
+                sent_copy = "saved" if saved else "unconfirmed"
+            except Exception:
+                logger.warning("SMTP succeeded but Sent copy is unconfirmed; do not resend")
+        return {
+            "smtp": "sent",
+            "sent_copy": sent_copy,
+            "message_id": str(msg.get("Message-Id", "")) if isinstance(msg, Message) else None,
+        }
+
+    async def move_to_trash(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
+        return await self.incoming_client.move_to_trash(email_ids, mailbox)
 
     async def create_draft(
         self,
