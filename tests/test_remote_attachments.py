@@ -322,6 +322,66 @@ async def test_fetch_uses_readonly_peek_and_returns_exact_bytes(email_server):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["login", "select", "metadata", "payload", "mime_headers", "decode"])
+@pytest.mark.parametrize("error", [AssertionError(), TimeoutError(), RuntimeError("private provider details")])
+async def test_read_failure_identifies_phase_without_provider_details(email_server, monkeypatch, phase, error):
+    client = EmailClient(email_server)
+    imap = AsyncMock()
+    imap._client_task = asyncio.get_running_loop().create_future()
+    imap._client_task.set_result(None)
+    imap.login.return_value = imap.select.return_value = ("OK", [])
+    imap.id.return_value = SimpleNamespace(result="OK")
+    responses = [
+        ("OK", [f"1 FETCH (UID 42 BODYSTRUCTURE {PDF})".encode()]),
+        ("OK", [bytearray(b"aGVsbG8=")]),
+        ("OK", [bytearray(b"Content-Type: application/pdf\r\nContent-Transfer-Encoding: base64\r\n")]),
+    ]
+    if phase in {"login", "select"}:
+        getattr(imap, phase).side_effect = error
+    elif phase == "decode":
+        monkeypatch.setattr(
+            "mcp_email_server.emails.classic.BytesParser", lambda **kwargs: (_ for _ in ()).throw(error)
+        )
+    else:
+        responses[{"metadata": 0, "payload": 1, "mime_headers": 2}[phase]] = error
+    imap.uid.side_effect = responses
+    expected = f"Attachment read failed at {phase} ({type(error).__name__})"
+    with (
+        patch.object(client, "_imap_connect", return_value=imap),
+        patch("mcp_email_server.emails.classic.logger.warning") as warning,
+        pytest.raises(ValueError) as raised,
+    ):
+        await client.get_attachment("42", "1", "private mailbox")
+    assert str(raised.value) == expected
+    warning.assert_called_once_with(expected)
+    imap.logout.assert_awaited_once()
+    assert imap.uid.await_count <= 3  # No retry or whole-message fallback.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["prepare", "mailbox_read", "response"])
+async def test_download_tool_sanitizes_failures_outside_imap(monkeypatch, phase):
+    error = AssertionError("private provider details")
+    handler = SimpleNamespace(
+        incoming_client=SimpleNamespace(
+            get_attachment=AsyncMock(return_value=BinaryAttachment("x.pdf", "application/pdf", b"x"))
+        )
+    )
+    monkeypatch.setattr(app, "dispatch_handler", lambda account: handler)
+    if phase == "prepare":
+        monkeypatch.setattr(app, "dispatch_handler", lambda account: (_ for _ in ()).throw(error))
+    elif phase == "mailbox_read":
+        handler.incoming_client.get_attachment.side_effect = error
+    else:
+        monkeypatch.setattr(app.attachment_transfers, "download", lambda *args: (_ for _ in ()).throw(error))
+    expected = f"Attachment read failed at {phase} (AssertionError)"
+    with patch.object(app.logger, "warning") as warning, pytest.raises(ValueError) as raised:
+        await app.get_attachment("private-account", "42", "1", ctx=caller())
+    assert str(raised.value) == expected
+    warning.assert_called_once_with(expected)
+
+
+@pytest.mark.asyncio
 async def test_fetch_rejects_oversize_before_payload_and_injected_uid(email_server):
     client = EmailClient(email_server)
     with pytest.raises(ValueError, match="Invalid"):

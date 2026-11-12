@@ -446,7 +446,7 @@ class EmailClient:
         async with _attachment_reads:
             return await self._get_attachment(email_id, attachment_id, mailbox)
 
-    async def _get_attachment(self, email_id: str, attachment_id: str, mailbox="INBOX") -> BinaryAttachment:  # noqa: C901 - fail-closed IMAP transfer checks
+    async def _get_attachment(self, email_id: str, attachment_id: str, mailbox="INBOX") -> BinaryAttachment:  # noqa: C901 - keep fail-closed checks beside their diagnostic phase
         if not mailbox or len(mailbox) > 1024 or any(c in mailbox for c in "\r\n\x00"):
             raise ValueError("Invalid mailbox name")
         if not re.fullmatch(r"[1-9][0-9]*", email_id) or not re.fullmatch(
@@ -454,40 +454,48 @@ class EmailClient:
         ):
             raise ValueError("Invalid IMAP UID or attachment section")
         imap = self._imap_connect()
+        phase = "connect"
         try:
             await imap._client_task
             await imap.wait_hello_from_server()
+            phase = "login"
             status, _ = await imap.login(self.email_server.user_name, self.email_server.password.get_secret_value())
             if str(status).upper() != "OK":
-                raise ValueError("Mailbox login failed")
+                raise ValueError("Mailbox login failed")  # noqa: TRY301 - validation stays beside its diagnostic phase
+            phase = "identify"
             await _send_imap_id(imap)
+            phase = "select"
             status, _ = await imap.select(_quote_mailbox(mailbox))
             if str(status).upper() != "OK":
-                raise ValueError("Mailbox unavailable")
+                raise ValueError("Mailbox unavailable")  # noqa: TRY301 - validation stays beside its diagnostic phase
+            phase = "metadata"
             infos = (await self._attachment_metadata(imap, [email_id])).get(email_id)
             if infos is None:
-                raise ValueError("Attachment metadata unavailable")
+                raise ValueError("Attachment metadata unavailable")  # noqa: TRY301 - validation stays beside its diagnostic phase
             info = next((i for i in infos if i.attachment_id == attachment_id), None)
             if info is None:
-                raise ValueError("Attachment section not found")
+                raise ValueError("Attachment section not found")  # noqa: TRY301 - validation stays beside its diagnostic phase
             if info.size > MAX_MESSAGE_BYTES:
-                raise ValueError("Encoded attachment exceeds transfer limit")
+                raise ValueError("Encoded attachment exceeds transfer limit")  # noqa: TRY301 - validation stays beside its diagnostic phase
             # This aioimaplib version does not enter SELECTED state after EXAMINE.
             # Use a fresh SELECT + PEEK session; never STORE or RFC822/BODY[] fallback.
+            phase = "payload"
             status, response = await imap.uid("fetch", email_id, f"(BODY.PEEK[{attachment_id}])")
             if str(status).upper() != "OK":
-                raise ValueError("Could not fetch attachment")
+                raise ValueError("Could not fetch attachment")  # noqa: TRY301 - validation stays beside its diagnostic phase
             payload = next((bytes(x) for x in response if isinstance(x, bytearray)), None)
             if payload is None or len(payload) > MAX_MESSAGE_BYTES:
-                raise ValueError("Attachment missing or exceeds transfer limit")
+                raise ValueError("Attachment missing or exceeds transfer limit")  # noqa: TRY301 - validation stays beside its diagnostic phase
             # Retrieve this part's headers for its original transfer encoding.
+            phase = "mime_headers"
             status, response = await imap.uid("fetch", email_id, f"(BODY.PEEK[{attachment_id}.MIME])")
             headers = next((bytes(x) for x in response if isinstance(x, bytearray)), None)
             if str(status).upper() != "OK" or headers is None or len(headers) > 65536:
-                raise ValueError("Attachment MIME headers unavailable")
+                raise ValueError("Attachment MIME headers unavailable")  # noqa: TRY301 - validation stays beside its diagnostic phase
+            phase = "decode"
             part = BytesParser(policy=default).parsebytes(headers.rstrip(b"\r\n") + b"\r\n\r\n" + payload)
             if part.get_content_type() != info.mime_type:
-                raise ValueError("Attachment MIME type differs from mailbox metadata")
+                raise ValueError("Attachment MIME type differs from mailbox metadata")  # noqa: TRY301 - validation stays beside its diagnostic phase
             encoding = str(part.get("Content-Transfer-Encoding", "")).strip().lower()
             if len(payload) != info.size:
                 # Gmail can report LF octets for an old LF-only APPEND while FETCH
@@ -501,7 +509,7 @@ class EmailClient:
                     and len(payload) - crlf_count == info.size
                 )
                 if not lf_count_matches:
-                    raise ValueError("Attachment size differs from mailbox metadata; no partial file returned")
+                    raise ValueError("Attachment size differs from mailbox metadata; no partial file returned")  # noqa: TRY301 - validation stays beside its diagnostic phase
             if encoding == "base64":
                 try:
                     base64.b64decode(b"".join(payload.split()), validate=True)
@@ -511,8 +519,17 @@ class EmailClient:
             if decoded is None and info.mime_type == "message/rfc822":
                 decoded = payload
             if decoded is None or len(decoded) > MAX_FILE_BYTES:
-                raise ValueError("Decoded attachment exceeds 16 MiB or cannot be decoded")
+                raise ValueError("Decoded attachment exceeds 16 MiB or cannot be decoded")  # noqa: TRY301 - validation stays beside its diagnostic phase
             return BinaryAttachment(info.name, info.mime_type, decoded)
+        except Exception as exc:
+            # FastMCP otherwise turns e.g. AssertionError()/TimeoutError() into a
+            # blank error. Never log provider exception text, arguments, locals,
+            # mailbox identities or payloads. Keep our explicit validation errors.
+            failure = f"Attachment read failed at {phase} ({type(exc).__name__})"
+            logger.warning(failure)
+            if isinstance(exc, ValueError) and str(exc):
+                raise
+            raise ValueError(failure) from exc
         finally:
             try:
                 await imap.logout()

@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
+from loguru import logger
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import BlobResourceContents, CallToolResult, EmbeddedResource, TextContent
 from pydantic import Field
@@ -112,23 +113,33 @@ def discard_attachment_transfer(transfer_id: str, ctx: Context = None) -> dict[s
 async def get_attachment(
     account_name: str, email_id: str, attachment_id: str, mailbox: str = "INBOX", ctx: Context = None
 ) -> CallToolResult:
-    caller = _attachment_caller(ctx)
-    handler = dispatch_handler(account_name)
-    if not hasattr(handler, "incoming_client"):
-        raise ValueError("Remote attachments require an IMAP account")
-    item = await handler.incoming_client.get_attachment(email_id, attachment_id, mailbox)
-    result = attachment_transfers.download(caller, item)
-    summary = {k: v for k, v in result.items() if k != "content_base64"} if result["complete"] else result
-    content = [TextContent(type="text", text=json.dumps(summary))]
-    if result["complete"]:
-        uri = f"attachment://mail/{quote(account_name, safe='')}/{email_id}/{attachment_id}/{quote(item.name, safe='')}"
-        content.append(
-            EmbeddedResource(
-                type="resource",
-                resource=BlobResourceContents(uri=uri, mimeType=item.mime_type, blob=result["content_base64"]),
+    phase = "prepare"
+    try:
+        caller = _attachment_caller(ctx)
+        handler = dispatch_handler(account_name)
+        if not hasattr(handler, "incoming_client"):
+            raise ValueError("Remote attachments require an IMAP account")  # noqa: TRY301 - validation stays beside its diagnostic phase
+        phase = "mailbox_read"
+        item = await handler.incoming_client.get_attachment(email_id, attachment_id, mailbox)
+        phase = "response"
+        result = attachment_transfers.download(caller, item)
+        summary = {k: v for k, v in result.items() if k != "content_base64"} if result["complete"] else result
+        content = [TextContent(type="text", text=json.dumps(summary))]
+        if result["complete"]:
+            uri = f"attachment://mail/{quote(account_name, safe='')}/{email_id}/{attachment_id}/{quote(item.name, safe='')}"
+            content.append(
+                EmbeddedResource(
+                    type="resource",
+                    resource=BlobResourceContents(uri=uri, mimeType=item.mime_type, blob=result["content_base64"]),
+                )
             )
-        )
-    return CallToolResult(content=content, structuredContent=result)
+        return CallToolResult(content=content, structuredContent=result)
+    except Exception as exc:
+        if isinstance(exc, ValueError) and str(exc):
+            raise
+        failure = f"Attachment read failed at {phase} ({type(exc).__name__})"
+        logger.warning(failure)
+        raise ValueError(failure) from exc
 
 
 @mcp.tool(

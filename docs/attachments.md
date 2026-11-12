@@ -63,6 +63,13 @@ RFC822/BODY[] fallback, and preserve unread flags. The pinned aioimaplib version
 does not update its internal selected state after EXAMINE, so this path uses
 SELECT plus PEEK rather than changing library internals.
 
+Unexpected read failures report the operation phase and exception class (for
+example `Attachment read failed at mime_headers (TimeoutError)`). Logs contain
+only those fixed phase labels and class names; provider exception text, mailbox
+identities, payloads and credentials are excluded. Existing explicit validation
+errors remain specific. No provider retry is added. This diagnostic does not by
+itself fix or establish the cause of a hosted read failure.
+
 ## Explicitly copy original attachments
 
 To reply or forward with original files, supply `attachment_sources` to
