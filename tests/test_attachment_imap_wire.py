@@ -14,15 +14,17 @@ from mcp_email_server.emails.classic import ClassicEmailHandler
 
 
 @pytest.mark.asyncio
-async def test_native_imap_metadata_peek_and_draft_bytes():  # noqa: C901 - wire protocol fixture
-    data = b"%PDF-1.7\x00\xffreal wire fixture"
-    payload = base64.b64encode(data)
+@pytest.mark.parametrize("legacy_lf_metadata", [False, True])
+async def test_native_imap_metadata_peek_and_draft_bytes(legacy_lf_metadata):  # noqa: C901 - wire protocol fixture
+    data = b"%PDF-1.7\x00\xffreal wire fixture" * (12000 if legacy_lf_metadata else 1)
+    payload_lf = base64.encodebytes(data)
+    payload = payload_lf.replace(b"\n", b"\r\n")
     mime = b'Content-Type: application/pdf\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: attachment; filename="invoice.pdf"\r\n\r\n'
     headers = b"From: sender@example.invalid\r\nTo: owner@example.invalid\r\nSubject: Fixture\r\nDate: Wed, 11 Nov 2026 12:00:00 +0000\r\nMessage-ID: <fixture@example.invalid>\r\n\r\n"
     tree = (
         b'(("TEXT" "PLAIN" NIL NIL NIL "7BIT" 5 1 NIL NIL)'
         b'("APPLICATION" "PDF" ("NAME" "invoice.pdf") NIL NIL "BASE64" '
-        + str(len(payload)).encode()
+        + str(len(payload_lf) if legacy_lf_metadata else len(payload)).encode()
         + b' NIL ("ATTACHMENT" ("FILENAME" "invoice.pdf"))) "MIXED")'
     )
     commands = []
@@ -115,6 +117,7 @@ async def test_native_imap_metadata_peek_and_draft_bytes():  # noqa: C901 - wire
             binary_attachments=[item, BinaryAttachment("empty.txt", "text/plain", b"")],
         )
         assert len(saved) == 1
+        assert b"\n" not in saved[0].replace(b"\r\n", b""), "APPEND must serialize RFC message CRLF"
         draft = BytesParser(policy=default).parsebytes(saved[0])
         attachments = list(draft.iter_attachments())
         assert [p.get_filename() for p in attachments] == ["invoice.pdf", "empty.txt"]

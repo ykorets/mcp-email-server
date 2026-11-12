@@ -13,7 +13,7 @@ from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.parser import BytesParser
-from email.policy import default
+from email.policy import SMTP, default
 from pathlib import Path
 from typing import Any
 
@@ -480,8 +480,6 @@ class EmailClient:
             payload = next((bytes(x) for x in response if isinstance(x, bytearray)), None)
             if payload is None or len(payload) > MAX_MESSAGE_BYTES:
                 raise ValueError("Attachment missing or exceeds transfer limit")
-            if len(payload) != info.size:
-                raise ValueError("Attachment size differs from mailbox metadata; no partial file returned")
             # Retrieve this part's headers for its original transfer encoding.
             status, response = await imap.uid("fetch", email_id, f"(BODY.PEEK[{attachment_id}.MIME])")
             headers = next((bytes(x) for x in response if isinstance(x, bytearray)), None)
@@ -490,7 +488,21 @@ class EmailClient:
             part = BytesParser(policy=default).parsebytes(headers.rstrip(b"\r\n") + b"\r\n\r\n" + payload)
             if part.get_content_type() != info.mime_type:
                 raise ValueError("Attachment MIME type differs from mailbox metadata")
-            if str(part.get("Content-Transfer-Encoding", "")).lower() == "base64":
+            encoding = str(part.get("Content-Transfer-Encoding", "")).strip().lower()
+            if len(payload) != info.size:
+                # Gmail can report LF octets for an old LF-only APPEND while FETCH
+                # returns canonical CRLF. Only base64 line endings are reversible
+                # without changing decoded file bytes; every other mismatch fails.
+                crlf_count = payload.count(b"\r\n")
+                lf_count_matches = (
+                    encoding == "base64"
+                    and crlf_count > 0
+                    and payload.count(b"\r") == payload.count(b"\n") == crlf_count
+                    and len(payload) - crlf_count == info.size
+                )
+                if not lf_count_matches:
+                    raise ValueError("Attachment size differs from mailbox metadata; no partial file returned")
+            if encoding == "base64":
                 try:
                     base64.b64decode(b"".join(payload.split()), validate=True)
                 except (ValueError, binascii.Error) as exc:
@@ -912,7 +924,7 @@ class EmailClient:
         msg["Date"] = email.utils.formatdate(localtime=True)
         sender_domain = self.sender.rsplit("@", 1)[-1].rstrip(">")
         msg["Message-Id"] = email.utils.make_msgid(domain=sender_domain)
-        if len(msg.as_bytes()) > MAX_MESSAGE_BYTES:
+        if len(msg.as_bytes(policy=SMTP)) > MAX_MESSAGE_BYTES:
             raise ValueError("Encoded message exceeds 25 MB")
 
         # Note: BCC recipients are not added to headers (they remain hidden)
@@ -1029,7 +1041,7 @@ class EmailClient:
                     status = result[0] if isinstance(result, tuple) else result
                     if str(status).upper() == "OK":
                         # Folder exists, append the message
-                        msg_bytes = msg.as_bytes()
+                        msg_bytes = msg.as_bytes(policy=SMTP)
                         logger.debug(f"Appending message to '{folder}'")
                         # aioimaplib.append signature: (message_bytes, mailbox, flags, date)
                         append_result = await imap.append(

@@ -12,6 +12,7 @@ import ssl
 from email.header import Header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.policy import SMTP
 
 import aioimaplib
 
@@ -101,7 +102,7 @@ def compose_draft_message(
     sender_domain = sender.rsplit("@", 1)[-1].rstrip(">")
     msg["Message-Id"] = email.utils.make_msgid(domain=sender_domain)
 
-    if len(msg.as_bytes()) > MAX_MESSAGE_BYTES:
+    if len(msg.as_bytes(policy=SMTP)) > MAX_MESSAGE_BYTES:
         raise ValueError("Encoded message exceeds 25 MB")
     return msg
 
@@ -188,7 +189,7 @@ async def append_to_drafts(
 
                 status = result[0] if isinstance(result, tuple) else result
                 if str(status).upper() == "OK":
-                    msg_bytes = msg.as_bytes()
+                    msg_bytes = msg.as_bytes(policy=SMTP)
                     logger.debug(f"Appending draft to '{folder}'")
                     append_started = True
                     append_result = await imap.append(
