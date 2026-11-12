@@ -99,3 +99,15 @@ def test_list_handles_literal_quoted_and_bare_special_names():
     assert listed_folders([b'(\\Sent) "/" Sent'])[0][1] == "Sent"
     assert listed_folders([b'(\\Trash) "/" {5}', bytearray(b"Trash")])[0][1] == "Trash"
     assert not listed_folders([b'(\\Noselect \\Trash) "/" "Trash"'])
+
+
+@pytest.mark.asyncio
+async def test_attachment_identity_change_stops_before_payload_fetch(email_server):
+    imap = connected()
+    imap.select.return_value = ("OK", [b"OK [UIDVALIDITY 99]"])
+    client = EmailClient(email_server)
+    with patch.object(client, "_imap_connect", return_value=imap):
+        with pytest.raises(ValueError):
+            await client.get_attachment("42", "2", expected_uidvalidity=98)
+    imap.uid.assert_not_called()
+    imap.logout.assert_awaited_once()

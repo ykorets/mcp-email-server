@@ -444,11 +444,15 @@ class EmailClient:
             raise ValueError("Could not retrieve attachment metadata")
         return structures_by_uid(data)
 
-    async def get_attachment(self, email_id: str, attachment_id: str, mailbox="INBOX") -> BinaryAttachment:
+    async def get_attachment(
+        self, email_id: str, attachment_id: str, mailbox="INBOX", expected_uidvalidity: int | None = None
+    ) -> BinaryAttachment:
         async with _attachment_reads:
-            return await self._get_attachment(email_id, attachment_id, mailbox)
+            return await self._get_attachment(email_id, attachment_id, mailbox, expected_uidvalidity)
 
-    async def _get_attachment(self, email_id: str, attachment_id: str, mailbox="INBOX") -> BinaryAttachment:  # noqa: C901 - keep fail-closed checks beside their diagnostic phase
+    async def _get_attachment(  # noqa: C901 - bounded MIME phases and identity checks fail closed
+        self, email_id: str, attachment_id: str, mailbox="INBOX", expected_uidvalidity: int | None = None
+    ) -> BinaryAttachment:
         if not mailbox or len(mailbox) > 1024 or any(c in mailbox for c in "\r\n\x00"):
             raise ValueError("Invalid mailbox name")
         if not re.fullmatch(r"[1-9][0-9]*", email_id) or not re.fullmatch(
@@ -467,9 +471,14 @@ class EmailClient:
             phase = "identify"
             await _send_imap_id(imap)
             phase = "select"
-            status, _ = await imap.select(_quote_mailbox(mailbox))
+            status, selected = await imap.select(_quote_mailbox(mailbox))
             if str(status).upper() != "OK":
                 raise ValueError("Mailbox unavailable")  # noqa: TRY301 - validation stays beside its diagnostic phase
+            if expected_uidvalidity is not None:
+                raw_selection = b" ".join(bytes(x) for x in selected if isinstance(x, (bytes, bytearray)))
+                validity = re.search(rb"UIDVALIDITY\s+(\d+)", raw_selection, re.I)
+                if not validity or int(validity[1]) != expected_uidvalidity:
+                    raise ValueError("Mailbox UIDVALIDITY changed; no attachment fetched")  # noqa: TRY301
             phase = "metadata"
             infos = (await self._attachment_metadata(imap, [email_id])).get(email_id)
             if infos is None:
@@ -1276,7 +1285,13 @@ class ClassicEmailHandler(EmailHandler):
             recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, **extra
         )
 
-        sent_copy = "provider_managed" if not self.save_to_sent else "unconfirmed"
+        sent_copy = (
+            "provider_managed"
+            if self.email_settings.outgoing.host.lower() in {"smtp.gmail.com", "smtp.googlemail.com"}
+            else "disabled"
+            if not self.save_to_sent
+            else "unconfirmed"
+        )
         if self.save_to_sent and msg:
             try:
                 saved = await self.outgoing_client.append_to_sent(
