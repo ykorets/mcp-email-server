@@ -9,7 +9,6 @@ The implementation follows the same pattern as append_to_sent in classic.py.
 
 import email.utils
 import ssl
-from email.header import Header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.policy import SMTP
@@ -35,10 +34,6 @@ def _create_ssl_context(verify_ssl: bool) -> ssl.SSLContext | None:
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
-
-
-def _encoded_header(value: str):
-    return Header(value, "utf-8") if any(ord(c) > 127 for c in value) else value
 
 
 def compose_draft_message(
@@ -81,8 +76,9 @@ def compose_draft_message(
     else:
         msg = text
 
-    msg["Subject"] = _encoded_header(subject)
-    msg["From"] = _encoded_header(sender)
+    # SMTP policy encodes Unicode strings; legacy Header objects cannot be folded by it.
+    msg["Subject"] = subject
+    msg["From"] = sender
 
     msg["To"] = ", ".join(recipients)
 
